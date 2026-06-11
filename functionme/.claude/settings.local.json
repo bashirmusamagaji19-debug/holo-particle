@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(xxd \"第二十一届研电赛技术论文模板.doc\")",
+      "Bash(npx -y @docx-mcp/docx-mcp@latest --help)",
+      "Bash(npx -y docxmcp@latest --help)",
+      "Bash(pip install *)",
+      "Bash(antiword *)",
+      "Bash(python *)"
+    ]
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git commit -m '初始提交：项目原始状态 *)",
+      "Bash(where git *)",
+      "Read(//c/Program Files/Git/bin/**)",
+      "Read(//c/Program Files \\(x86\\)/Git/bin/**)",
+      "Bash(cmd.exe *)",
+      "Bash(powershell *)"
+    ]
+  }
+}
