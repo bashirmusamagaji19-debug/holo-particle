@@ -278,36 +278,98 @@ class AggregateShape:
         }
 
 
+def _generate_convex_fragment(
+    target_radius_um: float,
+    num_vertices: int,
+    aspect_ratio: tuple,
+    radial_jitter: float,
+    spike_fraction: float,
+    indent_fraction: float,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generate one convex polyhedron fragment via star-shaped points → ConvexHull.
+
+    Returns (hull_vertices, hull_equations) where equations are (F, 4) arrays
+    with A*x + B*y + C*z + D <= 0 for points inside the hull.
+    """
+    ax, ay, az = aspect_ratio
+    n = max(6, num_vertices)
+
+    directions = rng.normal(0, 1, (n, 3))
+    norms = np.linalg.norm(directions, axis=1, keepdims=True)
+    directions = directions / np.where(norms < 1e-9, 1e-9, norms)
+
+    n_spike = max(1, int(n * spike_fraction))
+    n_indent = int(n * indent_fraction)
+    n_regular = n - n_spike - n_indent
+
+    categories = np.array([0] * n_regular + [1] * n_indent + [2] * n_spike)
+    rng.shuffle(categories)
+
+    radii = np.ones(n) * target_radius_um
+
+    mask_reg = categories == 0
+    if mask_reg.any():
+        radii[mask_reg] = target_radius_um * rng.uniform(
+            1.0 - radial_jitter, 1.0 + radial_jitter, size=mask_reg.sum())
+
+    mask_ind = categories == 1
+    if mask_ind.any():
+        radii[mask_ind] = target_radius_um * rng.uniform(
+            0.25, 0.65, size=mask_ind.sum())
+
+    mask_spike = categories == 2
+    if mask_spike.any():
+        radii[mask_spike] = target_radius_um * rng.uniform(
+            1.6, 2.5, size=mask_spike.sum())
+
+    points = directions * radii.reshape(-1, 1)
+    points[:, 0] *= ax
+    points[:, 1] *= ay
+    points[:, 2] *= az
+
+    try:
+        hull = ConvexHull(points)
+        vertices = points[hull.vertices]
+        equations = hull.equations.copy()
+    except Exception:
+        vertices = points
+        equations = np.zeros((0, 4))
+
+    return vertices, equations
+
+
 @dataclass
 class PolyhedronShape:
-    """Irregular particle — chipped polyhedron (like ice crystal fragment).
+    """Irregular particle — UNION of overlapping convex polyhedron fragments.
 
-    1. Generates a star-shaped point cloud → ConvexHull → base polyhedron.
-    2. Randomly chips off corners by intersecting with additional half-spaces,
-       producing a NON-CONVEX shape with flat truncation facets, notches,
-       and re-entrant angles — like fractured mineral grains.
+    Instead of a single convex hull (which can only produce convex outlines),
+    this generates 2-8 smaller convex "chunks" that partially overlap.
+    Their boolean UNION creates genuine non-convex features:
+    re-entrant angles, notches, gaps, and jagged outlines.
+
+    Each fragment is an independent star-shaped-point → ConvexHull polyhedron,
+    offset from the centroid and randomly oriented.
 
     Parameters
     ----------
     target_radius_um : float
-        Nominal radius scale.
+        Overall size scale for the particle.
     num_vertices : int
-        Number of direction vectors for the base convex hull.
+        Direction vectors per fragment.
     aspect_ratio : tuple
-        (ax, ay, az) stretch factors for plate/columnar habits.
+        (ax, ay, az) stretch factors.
     radial_jitter : float
-        Regular-point radius variation: radius ∈ [1-jitter, 1+jitter].
+        Per-fragment point radius variation.
     spike_fraction : float
-        Fraction of points pushed to 1.6–2.5× radius (extreme protrusions).
+        Fraction of spike points per fragment.
     indent_fraction : float
-        Fraction of points pulled to 0.25–0.65× radius (recessed → large facets).
-    num_chips : int
-        Number of corner-truncation planes to apply after the hull.
-        Each chip removes a wedge of material near a hull vertex, creating
-        flat cleavage-like facets and non-convex features.  0 = pure convex.
-    chip_depth : float
-        Mean depth of chips as a fraction of vertex distance from centroid
-        (~0.10 = shallow edge damage, ~0.35 = deep truncation).
+        Fraction of indent points per fragment.
+    num_fragments : int
+        Number of convex chunks to union (2-8 recommended).
+        More fragments = more non-convex features.
+    fragment_overlap : float
+        Controls how much fragments overlap (0=barely touching, 1=fully merged).
     """
     target_radius_um: float
     num_vertices: int
@@ -315,96 +377,70 @@ class PolyhedronShape:
     radial_jitter: float = 0.40
     spike_fraction: float = 0.12
     indent_fraction: float = 0.20
-    num_chips: int = 6
-    chip_depth: float = 0.22
-    _hull_vertices: np.ndarray = field(default=None, repr=False)
-    _clip_planes: np.ndarray = field(default=None, repr=False)
+    num_fragments: int = 3
+    fragment_overlap: float = 0.55
+    _fragment_eqs: list = field(default_factory=list, repr=False)
+    _fragment_centroids: list = field(default_factory=list, repr=False)
     _volume_um3: float = field(default=None, repr=False)
     _thickness_map: np.ndarray = field(default=None, repr=False)
     _voxel_centers: np.ndarray = field(default=None, repr=False)
 
     def initialize(self, rng: np.random.Generator, voxel_um: float = 0.5):
         ax, ay, az = self.aspect_ratio
-        n = self.num_vertices
+        R = self.target_radius_um
+        nf = int(np.clip(self.num_fragments, 2, 8))
 
-        # ---- 1. Random unit directions (uniform on sphere) ----
-        directions = rng.normal(0, 1, (n, 3))
-        norms = np.linalg.norm(directions, axis=1, keepdims=True)
-        directions = directions / np.where(norms < 1e-9, 1e-9, norms)
+        # Each fragment is smaller than the full target radius
+        frag_radius = R * float(np.clip(0.95 / (nf ** (1.0 / 3.0)), 0.45, 0.75))
+        # Fewer vertices per fragment (proportional to fragment size)
+        frag_verts = max(8, int(self.num_vertices * 0.6))
 
-        # ---- 2. Classify points into three categories ----
-        n_spike = max(1, int(n * self.spike_fraction))
-        n_indent = int(n * self.indent_fraction)
-        n_regular = n - n_spike - n_indent
+        self._fragment_eqs = []
+        self._fragment_centroids = []
+        max_extent = 0.0
 
-        categories = np.array([0] * n_regular + [1] * n_indent + [2] * n_spike)
-        rng.shuffle(categories)
+        for fi in range(nf):
+            # Random offset for this fragment from the centroid
+            if fi == 0:
+                offset = np.zeros(3)
+            else:
+                # Offset in a random direction, scaled by overlap
+                direction = rng.normal(0, 1, 3)
+                direction = direction / np.linalg.norm(direction)
+                max_offset = frag_radius * (1.0 - self.fragment_overlap * 0.5) * 1.3
+                offset = direction * rng.uniform(0.3, 1.0) * max_offset
 
-        # ---- 3. Assign random radii by category ----
-        radii = np.ones(n) * self.target_radius_um
+            # Slightly different aspect per fragment for variety
+            frag_aspect = (
+                ax * rng.uniform(0.9, 1.1),
+                ay * rng.uniform(0.9, 1.1),
+                az * rng.uniform(0.9, 1.1),
+            )
 
-        mask_reg = categories == 0
-        if mask_reg.any():
-            radii[mask_reg] = self.target_radius_um * rng.uniform(
-                1.0 - self.radial_jitter, 1.0 + self.radial_jitter,
-                size=mask_reg.sum())
+            verts, eqs = _generate_convex_fragment(
+                target_radius_um=frag_radius,
+                num_vertices=frag_verts,
+                aspect_ratio=frag_aspect,
+                radial_jitter=self.radial_jitter,
+                spike_fraction=self.spike_fraction,
+                indent_fraction=self.indent_fraction,
+                rng=rng,
+            )
 
-        mask_ind = categories == 1
-        if mask_ind.any():
-            radii[mask_ind] = self.target_radius_um * rng.uniform(
-                0.25, 0.65, size=mask_ind.sum())
+            # Translate equations to account for fragment offset
+            # Original: a·x + d <= 0
+            # Shifted:  a·(x - offset) + d = a·x + (d - a·offset) <= 0
+            if eqs.size > 0:
+                eqs_shifted = eqs.copy()
+                eqs_shifted[:, 3] -= np.dot(eqs[:, :3], offset)
+                self._fragment_eqs.append(eqs_shifted)
+                shifted_vertices = verts + offset
+                max_extent = max(max_extent, float(np.max(np.abs(shifted_vertices))))
+            self._fragment_centroids.append(offset)
 
-        mask_spike = categories == 2
-        if mask_spike.any():
-            radii[mask_spike] = self.target_radius_um * rng.uniform(
-                1.6, 2.5, size=mask_spike.sum())
-
-        # ---- 4. Scale directions → star-shaped point cloud ----
-        points = directions * radii.reshape(-1, 1)
-        points[:, 0] *= ax
-        points[:, 1] *= ay
-        points[:, 2] *= az
-
-        # ---- 5. Convex hull → base polyhedron ----
-        try:
-            hull = ConvexHull(points)
-            self._hull_vertices = points[hull.vertices]
-        except Exception:
-            self._hull_vertices = points
-
-        # ---- 6. Generate corner-chip clipping planes ----
-        clip_planes = []
-        if self.num_chips > 0 and len(self._hull_vertices) >= 6:
-            vertices = self._hull_vertices
-            centroid = np.mean(vertices, axis=0)
-
-            # Pick random vertices to chip (avoid chipping all — keep some shape)
-            n_actual = min(self.num_chips, len(vertices) // 2)
-            chip_idx = rng.choice(len(vertices), size=n_actual, replace=False)
-
-            for idx in chip_idx:
-                v = vertices[idx]
-                direction = v - centroid
-                dist = np.linalg.norm(direction)
-                if dist < 1e-9:
-                    continue
-                outward = direction / dist
-
-                # Place the clip plane between the centroid and the vertex.
-                # depth = fraction of the vertex-centroid distance.
-                # Keep the side toward centroid (remove the corner).
-                d = rng.uniform(0.6, 1.4) * self.chip_depth
-                p = centroid + (1.0 - d) * direction   # point on plane
-                plane_d = -np.dot(outward, p)          # outward·x + plane_d <= 0 → KEEP
-
-                clip_planes.append([outward[0], outward[1], outward[2], plane_d])
-
-        if clip_planes:
-            self._clip_planes = np.array(clip_planes)
-
-        # ---- 7. Voxelize with clip constraints ----
+        # ---- Voxelize the union ----
         self._thickness_map, self._volume_um3, self._voxel_centers = (
-            _voxelize_chipped_hull(self._hull_vertices, self._clip_planes, voxel_um)
+            _voxelize_fragment_union(self._fragment_eqs, max(max_extent, R), voxel_um)
         )
 
     def get_thickness_map(self, x_um: np.ndarray, y_um: np.ndarray) -> np.ndarray:
@@ -442,63 +478,52 @@ class PolyhedronShape:
             "radial_jitter": self.radial_jitter,
             "spike_fraction": self.spike_fraction,
             "indent_fraction": self.indent_fraction,
-            "num_chips": self.num_chips,
-            "chip_depth": self.chip_depth,
+            "num_fragments": self.num_fragments,
+            "fragment_overlap": self.fragment_overlap,
         }
 
 
 
-def _voxelize_chipped_hull(
-    hull_vertices: np.ndarray,
-    clip_planes: np.ndarray | None,
+def _voxelize_fragment_union(
+    fragment_eqs: list[np.ndarray],
+    extent_um: float,
     voxel_um: float,
     padding_um: float = 5.0,
 ) -> tuple[np.ndarray, float, np.ndarray]:
-    """Voxelize a convex hull with optional corner-chip clipping planes.
+    """Voxelize the UNION of multiple convex polyhedron fragments.
 
-    The shape is: convex_hull ∩ clip_plane_1 ∩ clip_plane_2 ∩ ...
+    Each fragment is defined by its half-space equations (F_i, 4).
+    A point is occupied if it satisfies ALL equations of AT LEAST ONE fragment:
+        occupied = OR_over_fragments(AND_over_faces(A*x + B*y + C*z + D <= 0))
 
-    Each clip plane equation (A,B,C,D) keeps points where A*x+B*y+C*z+D <= 0
-    (i.e., the side toward the centroid). Points on the outward side are removed,
-    creating flat truncation facets and non-convex features.
+    This boolean UNION is what creates genuine non-convex features:
+    re-entrant corners, notches, and jagged outlines in MIP projection.
 
-    When clip_planes is None or empty, this degenerates to pure convex hull
-    voxelization.
-
-    Slice-by-slice 2D processing — memory O(N^2).
+    Slice-by-slice 2D — memory O(N^2).
     """
-    extent = np.max(np.abs(hull_vertices)) + padding_um
+    extent = extent_um + padding_um
     n_voxels = int(np.ceil(2 * extent / voxel_um))
     if n_voxels % 2 == 0:
         n_voxels += 1
 
     voxel_centers = (np.arange(n_voxels) - n_voxels // 2) * voxel_um
-
-    # Precompute convex hull half-space equations
-    hull = ConvexHull(hull_vertices)
-    eq = hull.equations  # (F, 4): A*x + B*y + C*z + D <= 0 for inside
-
-    # Single 2D meshgrid for all z-slices
     X2D, Y2D = np.meshgrid(voxel_centers, voxel_centers, indexing="ij")
-
-    has_clips = clip_planes is not None and len(clip_planes) > 0
 
     thickness_map_um = np.zeros((n_voxels, n_voxels), dtype=np.float64)
     total_occupied = 0
 
     for z in voxel_centers:
-        occupied_2d = np.ones((n_voxels, n_voxels), dtype=bool)
+        occupied_2d = np.zeros((n_voxels, n_voxels), dtype=bool)
 
-        # Hull face constraints
-        for face_eq in eq:
-            A, B, C, D = face_eq
-            occupied_2d &= (A * X2D + B * Y2D + C * z + D) <= 1e-9
-
-        # Clip plane constraints: remove material beyond each plane
-        if has_clips:
-            for clip_eq in clip_planes:
-                A, B, C, D = clip_eq
-                occupied_2d &= (A * X2D + B * Y2D + C * z + D) <= 1e-9
+        for eqs in fragment_eqs:
+            if eqs.size == 0:
+                continue
+            # This fragment's occupied region at this z
+            frag_occ = np.ones((n_voxels, n_voxels), dtype=bool)
+            for face_eq in eqs:
+                A, B, C, D = face_eq
+                frag_occ &= (A * X2D + B * Y2D + C * z + D) <= 1e-9
+            occupied_2d |= frag_occ  # UNION across fragments
 
         thickness_map_um += occupied_2d.astype(np.float64)
         total_occupied += int(occupied_2d.sum())
@@ -520,7 +545,7 @@ class Particle:
     x_pixel: float  # 0-based column index in image
     y_pixel: float  # 0-based row index in image
     z_position_m: float
-    shape: SphereShape | AggregateShape | Polyhedron
+    shape: SphereShape | AggregateShape | PolyhedronShape
     volume_um3: float = 0.0
     equivalent_diameter_um: float = 0.0
 
@@ -544,8 +569,8 @@ def place_particles(
     poly_indent_fraction: float = 0.20,
     poly_vertex_min: int = 15,
     poly_vertex_max: int = 35,
-    poly_num_chips: int = 6,
-    poly_chip_depth: float = 0.22,
+    poly_num_fragments: int = 3,
+    poly_fragment_overlap: float = 0.55,
     max_attempts: int = 5000,
 ) -> list[Particle]:
     """Place particles on the image plane without overlap.
@@ -616,8 +641,10 @@ def place_particles(
                     jit = poly_radial_jitter * rng.uniform(0.7, 1.3)
                     spk = np.clip(poly_spike_fraction * rng.uniform(0.7, 1.3), 0.03, 0.30)
                     ind = np.clip(poly_indent_fraction * rng.uniform(0.7, 1.3), 0.05, 0.35)
-                    n_chips = rng.integers(max(0, poly_num_chips - 2), poly_num_chips + 3)
-                    cd = poly_chip_depth * rng.uniform(0.7, 1.4)
+                    nf_min = max(2, poly_num_fragments - 1)
+                    nf_max = min(8, poly_num_fragments + 1)
+                    nf = rng.integers(nf_min, nf_max + 1)
+                    fo = np.clip(poly_fragment_overlap * rng.uniform(0.7, 1.3), 0.25, 0.85)
                     shape = PolyhedronShape(
                         target_radius_um=radius_um,
                         num_vertices=n_vertices,
@@ -625,8 +652,8 @@ def place_particles(
                         radial_jitter=jit,
                         spike_fraction=spk,
                         indent_fraction=ind,
-                        num_chips=n_chips,
-                        chip_depth=cd,
+                        num_fragments=nf,
+                        fragment_overlap=fo,
                     )
                     shape.initialize(rng, voxel_um=_adaptive_voxel_um(radius_um))
 
@@ -664,7 +691,7 @@ def place_particles(
 # ===================================================================
 
 def compute_complex_transmittance(
-    shape: SphereShape | AggregateShape | Polyhedron,
+    shape: SphereShape | AggregateShape | PolyhedronShape,
     x_pixel: float,
     y_pixel: float,
     N: int,
@@ -1009,8 +1036,8 @@ def generate_hologram(
     poly_indent_fraction: float = 0.20,
     poly_vertex_min: int = 15,
     poly_vertex_max: int = 35,
-    poly_num_chips: int = 6,
-    poly_chip_depth: float = 0.22,
+    poly_num_fragments: int = 3,
+    poly_fragment_overlap: float = 0.55,
     fragmentation: str = "",
     output_dir: str = "./output/0001",
     prefix: str = "",
@@ -1086,18 +1113,18 @@ def generate_hologram(
 
     # ---- Fragmentation preset (overrides individual polyhedron params) ----
     frag_presets = {
-        # (jitter, spike, indent, v_min, v_max, num_chips, chip_depth)
-        "mild":    (0.25, 0.06, 0.10, 12, 22,  3, 0.12),
-        "medium":  (0.40, 0.12, 0.20, 15, 35,  6, 0.22),
-        "severe":  (0.55, 0.20, 0.30, 20, 45, 10, 0.35),
+        # (jitter, spike, indent, v_min, v_max, num_fragments, fragment_overlap)
+        "mild":    (0.25, 0.06, 0.10, 12, 22,  2, 0.65),
+        "medium":  (0.40, 0.12, 0.20, 15, 35,  4, 0.50),
+        "severe":  (0.55, 0.20, 0.30, 20, 45,  8, 0.35),
     }
     fragmentation_mode = fragmentation.lower() if fragmentation else "custom"
     if fragmentation_mode in frag_presets:
         p = frag_presets[fragmentation_mode]
         (poly_radial_jitter, poly_spike_fraction, poly_indent_fraction,
-         poly_vertex_min, poly_vertex_max, poly_num_chips, poly_chip_depth) = p
+         poly_vertex_min, poly_vertex_max, poly_num_fragments, poly_fragment_overlap) = p
         print(f"  多面体破碎度: {fragmentation_mode} (jitter={poly_radial_jitter}, spike={poly_spike_fraction}, "
-              f"indent={poly_indent_fraction}, chips={poly_num_chips}, chip_depth={poly_chip_depth})")
+              f"indent={poly_indent_fraction}, fragments={poly_num_fragments}, overlap={poly_fragment_overlap})")
     elif fragmentation_mode != "custom":
         raise ValueError(
             "fragmentation must be one of: custom, mild, medium, severe"
@@ -1118,8 +1145,8 @@ def generate_hologram(
         poly_indent_fraction=poly_indent_fraction,
         poly_vertex_min=poly_vertex_min,
         poly_vertex_max=poly_vertex_max,
-        poly_num_chips=poly_num_chips,
-        poly_chip_depth=poly_chip_depth,
+        poly_num_fragments=poly_num_fragments,
+        poly_fragment_overlap=poly_fragment_overlap,
     )
     n_sphere = sum(1 for p in particles if p.shape_type == "sphere")
     n_agg = sum(1 for p in particles if p.shape_type == "aggregate")
@@ -1170,6 +1197,8 @@ def generate_hologram(
         "poly_indent_fraction": poly_indent_fraction,
         "poly_vertex_min": poly_vertex_min,
         "poly_vertex_max": poly_vertex_max,
+        "poly_num_fragments": poly_num_fragments,
+        "poly_fragment_overlap": poly_fragment_overlap,
         "seed": seed,
     }
 
@@ -1244,10 +1273,10 @@ Examples:
                    help="Min polyhedron direction vectors.")
     p.add_argument("--poly-vertex-max", type=int, default=35,
                    help="Max polyhedron direction vectors.")
-    p.add_argument("--poly-num-chips", type=int, default=6,
-                   help="Number of corner-chip planes (0 = pure convex).")
-    p.add_argument("--poly-chip-depth", type=float, default=0.22,
-                   help="Mean chip depth as fraction of vertex distance.")
+    p.add_argument("--poly-num-fragments", type=int, default=3,
+                   help="Number of convex fragments to union (2-8).")
+    p.add_argument("--poly-fragment-overlap", type=float, default=0.55,
+                   help="Fragment overlap (0=barely touching, 1=fully merged).")
     return p.parse_args()
 
 
@@ -1274,8 +1303,8 @@ if __name__ == "__main__":
         poly_indent_fraction=args.poly_indent_fraction,
         poly_vertex_min=args.poly_vertex_min,
         poly_vertex_max=args.poly_vertex_max,
-        poly_num_chips=args.poly_num_chips,
-        poly_chip_depth=args.poly_chip_depth,
+        poly_num_fragments=args.poly_num_fragments,
+        poly_fragment_overlap=args.poly_fragment_overlap,
         fragmentation=args.fragmentation,
         output_dir=args.output_dir,
         prefix=args.prefix,
