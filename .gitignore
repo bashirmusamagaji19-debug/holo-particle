@@ -17,3 +17,7 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Image files (too large for repo, generated artifacts)
+*.bmp
+*.BMP

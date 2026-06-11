@@ -350,6 +350,51 @@ class HologramGeneratorGUI:
         self._add_sep(scroll_frame, row)
         row += 1
 
+        # ---- Polyhedron fragmentation ----
+        ttk.Label(scroll_frame, text="多面体破碎度", font=("Arial", 10, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 5)
+        )
+        row += 1
+
+        self.s_frag_var = tk.StringVar(value="custom")
+        frag_frame = ttk.Frame(scroll_frame)
+        frag_frame.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
+        ttk.Label(frag_frame, text="预设:").pack(side=tk.LEFT)
+        frag_combo = ttk.Combobox(frag_frame, textvariable=self.s_frag_var,
+                                   values=["custom", "mild", "medium", "severe"],
+                                   state="readonly", width=10)
+        frag_combo.pack(side=tk.LEFT, padx=5)
+        ttk.Label(frag_frame, text="(custom=使用下方参数 / mild / medium / severe)", foreground="gray").pack(side=tk.LEFT)
+        row += 1
+
+        ttk.Label(scroll_frame, text="(选择 mild/medium/severe 后忽略下方精细参数)", foreground="gray").grid(
+            row=row, column=0, columnspan=3, sticky=tk.W, padx=5
+        )
+        row += 1
+
+        self.s_poly_jitter_var = tk.DoubleVar(value=0.40)
+        self.s_poly_spike_var = tk.DoubleVar(value=0.12)
+        self.s_poly_indent_var = tk.DoubleVar(value=0.20)
+        self.s_poly_vmin_var = tk.IntVar(value=15)
+        self.s_poly_vmax_var = tk.IntVar(value=35)
+
+        self._add_entry(scroll_frame, "径向抖动 (jitter):", self.s_poly_jitter_var, row)
+        row += 1
+        self._add_entry(scroll_frame, "突刺比例 (spike):", self.s_poly_spike_var, row)
+        row += 1
+        self._add_entry(scroll_frame, "内缩比例 (indent):", self.s_poly_indent_var, row)
+        row += 1
+        self._add_entry(scroll_frame, "顶点数范围:", self.s_poly_vmin_var, row)
+        ttk.Label(scroll_frame, text=f"(最小, 最大={self.s_poly_vmax_var.get()})", foreground="gray").grid(
+            row=row, column=2, sticky=tk.W, padx=5
+        )
+        row += 1
+        self._add_entry(scroll_frame, "顶点数最大:", self.s_poly_vmax_var, row)
+        row += 1
+
+        self._add_sep(scroll_frame, row)
+        row += 1
+
         # ---- Noise ----
         ttk.Label(scroll_frame, text="噪声设置", font=("Arial", 10, "bold")).grid(
             row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 5)
@@ -516,6 +561,12 @@ class HologramGeneratorGUI:
             edge_sigma_px=self.s_edge_sigma_var.get(),
             roughness=self.s_roughness_var.get(),
             snr_db=self.s_snr_var.get(),
+            fragmentation=self.s_frag_var.get(),
+            poly_radial_jitter=self.s_poly_jitter_var.get(),
+            poly_spike_fraction=self.s_poly_spike_var.get(),
+            poly_indent_fraction=self.s_poly_indent_var.get(),
+            poly_vertex_min=self.s_poly_vmin_var.get(),
+            poly_vertex_max=self.s_poly_vmax_var.get(),
             output_dir=run_dir,
             prefix=prefix,
             seed=self.s_seed_var.get(),

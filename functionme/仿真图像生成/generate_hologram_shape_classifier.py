@@ -282,43 +282,91 @@ class AggregateShape:
 class PolyhedronShape:
     """Irregular particle — convex polyhedron (like ice crystal fragment).
 
-    A random 3D convex hull is generated from scattered points, optionally
-    stretched along one axis to create plate-like or columnar habits.
+    Generates a star-shaped point cloud by assigning strongly varying random
+    radii to uniformly distributed directions, then takes the convex hull.
+    The result has flat faces of varying size, sharp edges, and protruding
+    spike vertices — ideal for ice-crystal / mineral-fragment morphology.
+
+    Parameters
+    ----------
+    target_radius_um : float
+        Nominal radius scale.
+    num_vertices : int
+        Number of direction vectors (hull vertices will be a subset of these).
+    aspect_ratio : tuple
+        (ax, ay, az) stretch factors for plate/columnar habits.
+    radial_jitter : float
+        Controls regular-point radius variation: radius ∈ [1-jitter, 1+jitter].
+    spike_fraction : float
+        Fraction of points pushed to 1.6–2.5× radius (extreme protrusions).
+    indent_fraction : float
+        Fraction of points pulled to 0.25–0.65× radius (recessed → large facets).
     """
     target_radius_um: float
     num_vertices: int
     aspect_ratio: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    radial_jitter: float = 0.40
+    spike_fraction: float = 0.12
+    indent_fraction: float = 0.20
     _hull_vertices: np.ndarray = field(default=None, repr=False)
     _volume_um3: float = field(default=None, repr=False)
     _thickness_map: np.ndarray = field(default=None, repr=False)
     _voxel_centers: np.ndarray = field(default=None, repr=False)
 
     def initialize(self, rng: np.random.Generator, voxel_um: float = 0.5):
-        # Generate random points from a stretched 3D normal distribution.
-        # This produces a cloud with natural anisotropy, not a spherical shell.
-        # When fed into ConvexHull, the result is a faceted polyhedron with
-        # sharp edges and flat faces — ideal for ice-crystal-like fragments.
         ax, ay, az = self.aspect_ratio
-        n_total = self.num_vertices + self.num_vertices // 2  # fewer interior points
+        n = self.num_vertices
 
-        # Surface-biased points: use random radial scaling so some points
-        # are near the surface and some are deeper, creating flat faces
-        points = rng.normal(0, 1, (n_total, 3))
+        # ---- 1. Random unit directions (uniform on sphere) ----
+        directions = rng.normal(0, 1, (n, 3))
+        norms = np.linalg.norm(directions, axis=1, keepdims=True)
+        directions = directions / np.where(norms < 1e-9, 1e-9, norms)
 
-        # Radial rescaling: push points toward the surface to form sharp faces
-        norms = np.linalg.norm(points, axis=1, keepdims=True)
-        norms = np.where(norms < 1e-9, 1e-9, norms)
-        # Mix of surface and interior: 70% pushed to surface, 30% scattered
-        surface_mask = rng.uniform(0, 1, size=(n_total, 1)) < 0.7
-        r_uniform = rng.uniform(0.6, 1.0, size=(n_total, 1))
-        scaling = np.where(surface_mask, 1.0, r_uniform)
-        points = points / norms * self.target_radius_um * scaling
+        # ---- 2. Classify points into three categories ----
+        n_spike = max(1, int(n * self.spike_fraction))
+        n_indent = int(n * self.indent_fraction)
+        n_regular = n - n_spike - n_indent
+
+        # Shuffle category assignment so they are spatially mixed
+        categories = np.array(
+            [0] * n_regular + [1] * n_indent + [2] * n_spike
+        )
+        rng.shuffle(categories)
+
+        # ---- 3. Assign random radii by category ----
+        radii = np.ones(n) * self.target_radius_um
+
+        # Regular: moderate random variation around target radius
+        mask_reg = categories == 0
+        if mask_reg.any():
+            radii[mask_reg] = self.target_radius_um * rng.uniform(
+                1.0 - self.radial_jitter, 1.0 + self.radial_jitter,
+                size=mask_reg.sum(),
+            )
+
+        # Indented: pulled inward → these form large flat facet surfaces
+        mask_ind = categories == 1
+        if mask_ind.any():
+            radii[mask_ind] = self.target_radius_um * rng.uniform(
+                0.25, 0.65, size=mask_ind.sum(),
+            )
+
+        # Spikes: pushed far outward → sharp protruding vertices
+        mask_spike = categories == 2
+        if mask_spike.any():
+            radii[mask_spike] = self.target_radius_um * rng.uniform(
+                1.6, 2.5, size=mask_spike.sum(),
+            )
+
+        # ---- 4. Scale directions by radii → star-shaped point cloud ----
+        points = directions * radii.reshape(-1, 1)
 
         # Apply aspect ratio stretching
         points[:, 0] *= ax
         points[:, 1] *= ay
         points[:, 2] *= az
 
+        # ---- 5. Convex hull → faceted polyhedron ----
         try:
             hull = ConvexHull(points)
             self._hull_vertices = points[hull.vertices]
@@ -327,7 +375,7 @@ class PolyhedronShape:
             self._hull_vertices = points
             self._volume_um3 = (4.0 / 3.0) * np.pi * self.target_radius_um**3
 
-        # Voxelize the convex hull
+        # ---- 6. Voxelize ----
         self._thickness_map, self._volume_um3, self._voxel_centers = (
             _voxelize_convex_hull(self._hull_vertices, voxel_um)
         )
@@ -364,6 +412,9 @@ class PolyhedronShape:
             "target_radius_um": self.target_radius_um,
             "num_vertices": self.num_vertices,
             "aspect_ratio": list(self.aspect_ratio),
+            "radial_jitter": self.radial_jitter,
+            "spike_fraction": self.spike_fraction,
+            "indent_fraction": self.indent_fraction,
         }
 
 
@@ -446,6 +497,11 @@ def place_particles(
     z_range_m: tuple[float, float],
     rng: np.random.Generator,
     irregular_type: str = "aggregate",
+    poly_radial_jitter: float = 0.40,
+    poly_spike_fraction: float = 0.12,
+    poly_indent_fraction: float = 0.20,
+    poly_vertex_min: int = 15,
+    poly_vertex_max: int = 35,
     max_attempts: int = 5000,
 ) -> list[Particle]:
     """Place particles on the image plane without overlap.
@@ -506,17 +562,23 @@ def place_particles(
                     shape = AggregateShape(target_radius_um=radius_um, num_sub_spheres=n_sub)
                     shape.initialize(rng, voxel_um=_adaptive_voxel_um(radius_um))
                 else:  # polyhedron
-                    n_vertices = rng.integers(6, 14)
-                    # Stronger, more varied aspect ratios for plate/column/irregular habits
+                    n_vertices = rng.integers(poly_vertex_min, poly_vertex_max + 1)
                     aspect = (
                         rng.uniform(0.25, 1.0),
                         rng.uniform(0.25, 1.0),
                         rng.uniform(0.15, 1.0),
                     )
+                    # Randomize within +/-30% of the nominal parameter values
+                    jit = poly_radial_jitter * rng.uniform(0.7, 1.3)
+                    spk = np.clip(poly_spike_fraction * rng.uniform(0.7, 1.3), 0.03, 0.30)
+                    ind = np.clip(poly_indent_fraction * rng.uniform(0.7, 1.3), 0.05, 0.35)
                     shape = PolyhedronShape(
                         target_radius_um=radius_um,
                         num_vertices=n_vertices,
                         aspect_ratio=aspect,
+                        radial_jitter=jit,
+                        spike_fraction=spk,
+                        indent_fraction=ind,
                     )
                     shape.initialize(rng, voxel_um=_adaptive_voxel_um(radius_um))
 
@@ -894,6 +956,12 @@ def generate_hologram(
     edge_sigma_px: float = 0.8,
     roughness: float = 0.03,
     snr_db: float = 0.0,
+    poly_radial_jitter: float = 0.40,
+    poly_spike_fraction: float = 0.12,
+    poly_indent_fraction: float = 0.20,
+    poly_vertex_min: int = 15,
+    poly_vertex_max: int = 35,
+    fragmentation: str = "",
     output_dir: str = "./output/0001",
     prefix: str = "",
     seed: int = 42,
@@ -966,6 +1034,22 @@ def generate_hologram(
     print(f"  输出目录:  {output_dir}")
     print("-" * 60)
 
+    # ---- Fragmentation preset (overrides individual polyhedron params) ----
+    frag_presets = {
+        "mild":    (0.25, 0.06, 0.10, 12, 22),   # (jitter, spike, indent, v_min, v_max)
+        "medium":  (0.40, 0.12, 0.20, 15, 35),
+        "severe":  (0.55, 0.20, 0.30, 20, 45),
+    }
+    fragmentation_mode = fragmentation.lower() if fragmentation else "custom"
+    if fragmentation_mode in frag_presets:
+        p = frag_presets[fragmentation_mode]
+        poly_radial_jitter, poly_spike_fraction, poly_indent_fraction, poly_vertex_min, poly_vertex_max = p
+        print(f"  多面体破碎度: {fragmentation_mode} (jitter={poly_radial_jitter}, spike={poly_spike_fraction}, indent={poly_indent_fraction})")
+    elif fragmentation_mode != "custom":
+        raise ValueError(
+            "fragmentation must be one of: custom, mild, medium, severe"
+        )
+
     # Place particles
     print("[1/4] 放置粒子...")
     particles = place_particles(
@@ -976,6 +1060,11 @@ def generate_hologram(
         radius_um_range=radius_um_range,
         z_range_m=z_range,
         rng=rng,
+        poly_radial_jitter=poly_radial_jitter,
+        poly_spike_fraction=poly_spike_fraction,
+        poly_indent_fraction=poly_indent_fraction,
+        poly_vertex_min=poly_vertex_min,
+        poly_vertex_max=poly_vertex_max,
     )
     n_sphere = sum(1 for p in particles if p.shape_type == "sphere")
     n_agg = sum(1 for p in particles if p.shape_type == "aggregate")
@@ -1020,6 +1109,12 @@ def generate_hologram(
         "edge_sigma_px": edge_sigma_px,
         "roughness": roughness,
         "snr_db": snr_db,
+        "fragmentation": fragmentation_mode,
+        "poly_radial_jitter": poly_radial_jitter,
+        "poly_spike_fraction": poly_spike_fraction,
+        "poly_indent_fraction": poly_indent_fraction,
+        "poly_vertex_min": poly_vertex_min,
+        "poly_vertex_max": poly_vertex_max,
         "seed": seed,
     }
 
@@ -1082,6 +1177,18 @@ Examples:
     p.add_argument("--edge-sigma", type=float, default=0.8, help="Edge blur sigma (pixels).")
     p.add_argument("--roughness", type=float, default=0.03, help="Surface roughness std (irregular only).")
     p.add_argument("--snr", type=float, default=0.0, help="Noise SNR (dB). 0=no noise.")
+    p.add_argument("--fragmentation", choices=["custom", "mild", "medium", "severe"], default="custom",
+                   help="Polyhedron fragmentation preset (overrides --poly-*).")
+    p.add_argument("--poly-radial-jitter", type=float, default=0.40,
+                   help="Polyhedron radial radius variation (0-1).")
+    p.add_argument("--poly-spike-fraction", type=float, default=0.12,
+                   help="Polyhedron spike point fraction (0-0.3).")
+    p.add_argument("--poly-indent-fraction", type=float, default=0.20,
+                   help="Polyhedron indent point fraction (0-0.3).")
+    p.add_argument("--poly-vertex-min", type=int, default=15,
+                   help="Min polyhedron direction vectors.")
+    p.add_argument("--poly-vertex-max", type=int, default=35,
+                   help="Max polyhedron direction vectors.")
     return p.parse_args()
 
 
@@ -1103,6 +1210,12 @@ if __name__ == "__main__":
         edge_sigma_px=args.edge_sigma,
         roughness=args.roughness,
         snr_db=args.snr,
+        poly_radial_jitter=args.poly_radial_jitter,
+        poly_spike_fraction=args.poly_spike_fraction,
+        poly_indent_fraction=args.poly_indent_fraction,
+        poly_vertex_min=args.poly_vertex_min,
+        poly_vertex_max=args.poly_vertex_max,
+        fragmentation=args.fragmentation,
         output_dir=args.output_dir,
         prefix=args.prefix,
         seed=args.seed,
