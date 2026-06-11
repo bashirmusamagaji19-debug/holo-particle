@@ -1,126 +1,421 @@
+#!/usr/bin/env python3
+"""
+generate_hologram_gui.py
+=========================
+GUI for generating digital holograms.
+
+Two modes:
+  - 标准仿真: Original MATLAB-validation hologram generator
+               (binary mask + Born approximation, small particles 10-20um)
+  - 形状分类: Shape-classification hologram generator
+               (complex transmittance thin screen, 50-100um particles,
+                sphere / aggregate / polyhedron types, 1024x1024)
+
+Usage:
+  python generate_hologram_gui.py
+"""
+
 import os
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from generate_hologram_matlab_validation_new import generate_hologram
+from generate_hologram_matlab_validation_new import generate_hologram as gen_standard
+from generate_hologram_shape_classifier import generate_hologram as gen_shape
 
 
 class HologramGeneratorGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("数字全息仿真图像生成器")
-        self.root.geometry("500x650")
-        self.root.resizable(False, False)
+        self.root.geometry("560x820")
+        self.root.resizable(True, True)
+        self.root.minsize(520, 700)
 
         style = ttk.Style()
         style.theme_use("clam")
 
-        main_frame = ttk.Frame(self.root, padding="20 20 20 20")
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        # ---- Top: mode selector ----
+        top_bar = ttk.Frame(self.root, padding="10 10 10 5")
+        top_bar.pack(fill=tk.X)
+
+        ttk.Label(top_bar, text="生成模式:", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
+        self.mode_var = tk.StringVar(value="标准仿真")
+        mode_combo = ttk.Combobox(
+            top_bar,
+            textvariable=self.mode_var,
+            values=["标准仿真", "形状分类"],
+            state="readonly",
+            width=16,
+        )
+        mode_combo.pack(side=tk.LEFT, padx=10)
+        mode_combo.bind("<<ComboboxSelected>>", self.on_mode_changed)
+
+        # ---- Notebook for parameter pages ----
+        self.notebook = ttk.Notebook(self.root, padding="10 5 10 10")
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Page 1: standard mode
+        self.page_standard = ttk.Frame(self.notebook)
+        self.notebook.add(self.page_standard, text="标准仿真")
+
+        # Page 2: shape classification mode
+        self.page_shape = ttk.Frame(self.notebook)
+        self.notebook.add(self.page_shape, text="形状分类")
+
+        # ---- Shared: output + action bar ----
+        bottom_bar = ttk.Frame(self.root, padding="10 5 10 10")
+        bottom_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+        out_frame = ttk.Frame(bottom_bar)
+        out_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(out_frame, text="保存至:").pack(side=tk.LEFT)
+        self.outdir_var = tk.StringVar(value=os.path.abspath("./"))
+        ttk.Entry(out_frame, textvariable=self.outdir_var, width=40).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Button(out_frame, text="浏览...", command=self.browse_dir).pack(side=tk.LEFT)
+
+        self.generate_btn = ttk.Button(bottom_bar, text="生成全息图及真值", command=self.start_generation)
+        self.generate_btn.pack(pady=8, ipadx=10, ipady=5)
+
+        self.status_var = tk.StringVar(value="就绪")
+        ttk.Label(bottom_bar, textvariable=self.status_var, foreground="gray").pack()
+
+        # ---- Build parameter pages ----
+        self._build_standard_page()
+        self._build_shape_page()
+
+        # Show default page
+        self.on_mode_changed()
+
+    # ==================================================================
+    # Standard simulation page (unchanged from original)
+    # ==================================================================
+
+    def _build_standard_page(self):
+        parent = self.page_standard
+        canvas = tk.Canvas(parent, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas)
+
+        scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        row = 0
+
+        # System params
+        ttk.Label(scroll_frame, text="系统参数", font=("Arial", 10, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 5)
+        )
+        row += 1
 
         self.wavelength_var = tk.DoubleVar(value=632.8)
-        self.dx_var = tk.DoubleVar(value=2.2)
-        self.dy_var = tk.DoubleVar(value=2.2)
-        self.n_var = tk.IntVar(value=256)
+        self.dx_var = tk.DoubleVar(value=3.45)
+        self.dy_var = tk.DoubleVar(value=3.45)
+        self.n_var = tk.IntVar(value=1024)
+
+        self._add_entry(scroll_frame, "波长 (nm):", self.wavelength_var, row)
+        row += 1
+        self._add_entry(scroll_frame, "像素尺寸 dx (um):", self.dx_var, row)
+        row += 1
+        self._add_entry(scroll_frame, "像素尺寸 dy (um):", self.dy_var, row)
+        row += 1
+        self._add_entry(scroll_frame, "图像尺寸 N:", self.n_var, row)
+        row += 1
+
+        self._add_sep(scroll_frame, row)
+        row += 1
+
+        # Particle params
+        ttk.Label(scroll_frame, text="粒子参数（圆形）", font=("Arial", 10, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 5)
+        )
+        row += 1
 
         self.dmin_var = tk.DoubleVar(value=10.0)
         self.dmax_var = tk.DoubleVar(value=20.0)
         self.num_var = tk.IntVar(value=15)
 
-        self.zmin_var = tk.DoubleVar(value=2.0)
-        self.zmax_var = tk.DoubleVar(value=8.0)
+        self._add_entry(scroll_frame, "最小直径 (um):", self.dmin_var, row)
+        row += 1
+        self._add_entry(scroll_frame, "最大直径 (um):", self.dmax_var, row)
+        row += 1
+        self._add_entry(scroll_frame, "粒子数量:", self.num_var, row)
+        row += 1
+
+        self._add_sep(scroll_frame, row)
+        row += 1
+
+        # Z-axis
+        ttk.Label(scroll_frame, text="轴向分布 (Z轴)", font=("Arial", 10, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 5)
+        )
+        row += 1
+
+        self.zmin_var = tk.DoubleVar(value=20.0)
+        self.zmax_var = tk.DoubleVar(value=35.0)
         self.zstep_var = tk.DoubleVar(value=40.0)
 
+        self._add_entry(scroll_frame, "最小距离 Z_min (mm):", self.zmin_var, row)
+        row += 1
+        self._add_entry(scroll_frame, "最大距离 Z_max (mm):", self.zmax_var, row)
+        row += 1
+        self._add_entry(scroll_frame, "轴向层间距 (um):", self.zstep_var, row)
+        row += 1
+
+        self._add_sep(scroll_frame, row)
+        row += 1
+
+        # Noise
+        ttk.Label(scroll_frame, text="噪声设置", font=("Arial", 10, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 5)
+        )
+        row += 1
+        ttk.Label(scroll_frame, text="(留空或输入 0 表示无噪声)").grid(row=row, column=1, sticky=tk.W, padx=5)
+        row += 1
+
         self.snr_var = tk.DoubleVar(value=20.0)
-        self.outdir_var = tk.StringVar(value=os.path.abspath("./"))
+        self._add_entry(scroll_frame, "信噪比 SNR (dB):", self.snr_var, row)
+        row += 1
 
-        self.create_widgets(main_frame)
+        # Spacer
+        ttk.Label(scroll_frame, text="").grid(row=row, column=0)
+        row += 1
+        ttk.Label(scroll_frame, text="提示: 标准仿真使用二值掩膜 + Born 近似", foreground="gray").grid(
+            row=row, column=0, columnspan=3, sticky=tk.W, pady=(10, 0)
+        )
+        row += 1
+        ttk.Label(scroll_frame, text="适用于 10-20um 级小粒子，输出 BMP + CSV", foreground="gray").grid(
+            row=row, column=0, columnspan=3, sticky=tk.W
+        )
 
-    def create_widgets(self, parent):
+    # ==================================================================
+    # Shape classification page
+    # ==================================================================
+
+    def _build_shape_page(self):
+        parent = self.page_shape
+        canvas = tk.Canvas(parent, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas)
+
+        scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
         row = 0
 
-        ttk.Label(parent, text="系统参数", font=("Arial", 10, "bold")).grid(
+        # ---- System params ----
+        ttk.Label(scroll_frame, text="系统参数", font=("Arial", 10, "bold")).grid(
             row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 5)
         )
         row += 1
 
-        self.add_entry(parent, "波长 (nm):", self.wavelength_var, row)
+        self.s_wavelength_var = tk.DoubleVar(value=638.0)
+        self.s_pixel_var = tk.DoubleVar(value=3.45)
+        self.s_N_var = tk.IntVar(value=1024)
+
+        self._add_entry(scroll_frame, "波长 (nm):", self.s_wavelength_var, row)
         row += 1
-        self.add_entry(parent, "像素尺寸 dx (μm):", self.dx_var, row)
+        self._add_entry(scroll_frame, "像素尺寸 (um):", self.s_pixel_var, row)
         row += 1
-        self.add_entry(parent, "像素尺寸 dy (μm):", self.dy_var, row)
-        row += 1
-        self.add_entry(parent, "图像尺寸 N:", self.n_var, row)
+        self._add_entry(scroll_frame, "图像尺寸 N:", self.s_N_var, row)
         row += 1
 
-        ttk.Separator(parent, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=10)
+        self._add_sep(scroll_frame, row)
         row += 1
 
-        ttk.Label(parent, text="粒子参数", font=("Arial", 10, "bold")).grid(
+        # ---- Particle count ----
+        ttk.Label(scroll_frame, text="粒子数量与类型", font=("Arial", 10, "bold")).grid(
             row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 5)
         )
         row += 1
 
-        self.add_entry(parent, "最小直径 (μm):", self.dmin_var, row)
+        self.s_circular_var = tk.IntVar(value=10)
+        self.s_irregular_var = tk.IntVar(value=10)
+
+        self._add_entry(scroll_frame, "圆形粒子数:", self.s_circular_var, row)
+        ttk.Label(scroll_frame, text="(sphere, 标准球体)", foreground="gray").grid(
+            row=row, column=2, sticky=tk.W, padx=5
+        )
         row += 1
-        self.add_entry(parent, "最大直径 (μm):", self.dmax_var, row)
-        row += 1
-        self.add_entry(parent, "粒子数量:", self.num_var, row)
+        self._add_entry(scroll_frame, "不规则粒子数:", self.s_irregular_var, row)
+        ttk.Label(scroll_frame, text="(聚合球体 + 凸多面体)", foreground="gray").grid(
+            row=row, column=2, sticky=tk.W, padx=5
+        )
         row += 1
 
-        ttk.Separator(parent, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=10)
+        self._add_sep(scroll_frame, row)
         row += 1
 
-        ttk.Label(parent, text="轴向分布 (Z轴)", font=("Arial", 10, "bold")).grid(
+        # ---- Particle size ----
+        ttk.Label(scroll_frame, text="粒子尺寸（半径）", font=("Arial", 10, "bold")).grid(
             row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 5)
         )
         row += 1
 
-        self.add_entry(parent, "最小距离 Z_min (mm):", self.zmin_var, row)
+        self.s_radius_min_var = tk.DoubleVar(value=50.0)
+        self.s_radius_max_var = tk.DoubleVar(value=100.0)
+
+        self._add_entry(scroll_frame, "最小半径 (um):", self.s_radius_min_var, row)
         row += 1
-        self.add_entry(parent, "最大距离 Z_max (mm):", self.zmax_var, row)
-        row += 1
-        self.add_entry(parent, "轴向层间距 (μm):", self.zstep_var, row)
+        self._add_entry(scroll_frame, "最大半径 (um):", self.s_radius_max_var, row)
         row += 1
 
-        ttk.Separator(parent, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=10)
+        self._add_sep(scroll_frame, row)
         row += 1
 
-        ttk.Label(parent, text="噪声设置", font=("Arial", 10, "bold")).grid(
+        # ---- Optical properties ----
+        ttk.Label(scroll_frame, text="光学参数", font=("Arial", 10, "bold")).grid(
             row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 5)
         )
         row += 1
 
-        ttk.Label(parent, text="(留空或输入 0 表示无噪声)").grid(row=row, column=1, sticky=tk.W, padx=5)
+        self.s_n_particle_var = tk.DoubleVar(value=1.5)
+        self.s_n_medium_var = tk.DoubleVar(value=1.0)
+        self.s_attenuation_var = tk.DoubleVar(value=0.6)
+
+        self._add_entry(scroll_frame, "粒子折射率 n:", self.s_n_particle_var, row)
         row += 1
-        self.add_entry(parent, "信噪比 SNR (dB):", self.snr_var, row)
+        self._add_entry(scroll_frame, "介质折射率 n0:", self.s_n_medium_var, row)
+        row += 1
+        self._add_entry(scroll_frame, "振幅衰减 (0~1):", self.s_attenuation_var, row)
+        ttk.Label(scroll_frame, text="(0=不透明, 1=全透明)", foreground="gray").grid(
+            row=row, column=2, sticky=tk.W, padx=5
+        )
         row += 1
 
-        ttk.Separator(parent, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=10)
+        self._add_sep(scroll_frame, row)
         row += 1
 
-        ttk.Label(parent, text="导出设置", font=("Arial", 10, "bold")).grid(
+        # ---- Z range ----
+        ttk.Label(scroll_frame, text="轴向范围 (Z轴)", font=("Arial", 10, "bold")).grid(
             row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 5)
         )
         row += 1
 
-        ttk.Label(parent, text="保存至:").grid(row=row, column=0, sticky=tk.W)
-        ttk.Entry(parent, textvariable=self.outdir_var, state="readonly", width=30).grid(row=row, column=1, padx=5)
-        ttk.Button(parent, text="浏览...", command=self.browse_dir).grid(row=row, column=2, sticky=tk.E)
+        self.s_zmin_var = tk.DoubleVar(value=20.0)
+        self.s_zmax_var = tk.DoubleVar(value=35.0)
+
+        self._add_entry(scroll_frame, "最小距离 (mm):", self.s_zmin_var, row)
+        row += 1
+        self._add_entry(scroll_frame, "最大距离 (mm):", self.s_zmax_var, row)
         row += 1
 
-        self.generate_btn = ttk.Button(parent, text="生成全息图及真值", command=self.start_generation)
-        self.generate_btn.grid(row=row, column=0, columnspan=3, pady=20, ipadx=10, ipady=5)
+        self._add_sep(scroll_frame, row)
+        row += 1
 
-        self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(parent, textvariable=self.status_var, foreground="gray").grid(
-            row=row + 1, column=0, columnspan=3, sticky=tk.W
+        # ---- Edge & roughness ----
+        ttk.Label(scroll_frame, text="表面与边缘参数", font=("Arial", 10, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 5)
         )
+        row += 1
 
-    def add_entry(self, parent, label_text, variable, row):
+        self.s_edge_sigma_var = tk.DoubleVar(value=0.8)
+        self.s_roughness_var = tk.DoubleVar(value=0.03)
+
+        self._add_entry(scroll_frame, "边缘模糊 sigma (px):", self.s_edge_sigma_var, row)
+        ttk.Label(scroll_frame, text="(粒子边缘高斯过渡宽度)", foreground="gray").grid(
+            row=row, column=2, sticky=tk.W, padx=5
+        )
+        row += 1
+        self._add_entry(scroll_frame, "表面粗糙度:", self.s_roughness_var, row)
+        ttk.Label(scroll_frame, text="(不规则粒子 A(x,y) 扰动 std)", foreground="gray").grid(
+            row=row, column=2, sticky=tk.W, padx=5
+        )
+        row += 1
+
+        self._add_sep(scroll_frame, row)
+        row += 1
+
+        # ---- Noise ----
+        ttk.Label(scroll_frame, text="噪声设置", font=("Arial", 10, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 5)
+        )
+        row += 1
+
+        self.s_snr_var = tk.DoubleVar(value=0.0)
+        self._add_entry(scroll_frame, "信噪比 SNR (dB):", self.s_snr_var, row)
+        ttk.Label(scroll_frame, text="(0 = 无噪声)", foreground="gray").grid(
+            row=row, column=2, sticky=tk.W, padx=5
+        )
+        row += 1
+
+        self._add_sep(scroll_frame, row)
+        row += 1
+
+        # ---- Seed ----
+        ttk.Label(scroll_frame, text="随机种子", font=("Arial", 10, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 5)
+        )
+        row += 1
+
+        self.s_seed_var = tk.IntVar(value=42)
+        self._add_entry(scroll_frame, "随机种子:", self.s_seed_var, row)
+        ttk.Label(scroll_frame, text="(同种子 = 可复现)", foreground="gray").grid(
+            row=row, column=2, sticky=tk.W, padx=5
+        )
+        row += 1
+
+        # Spacer + hints
+        ttk.Label(scroll_frame, text="").grid(row=row, column=0)
+        row += 1
+        hints = [
+            "物理模型: 复透射率薄屏 t=A*exp(ik*Dn*h) + 角谱传播",
+            "输出: BMP + .mat (float64) + CSV (含 particle_id/type/volume)",
+            "不规则粒子: 一半聚合球体 (PTFE-like), 一半凸多面体 (ice-crystal-like)",
+            "圆形/不规则走同一物理管线, 差异仅来自形态本身",
+        ]
+        for hint in hints:
+            ttk.Label(scroll_frame, text=f"  > {hint}", foreground="gray").grid(
+                row=row, column=0, columnspan=3, sticky=tk.W
+            )
+            row += 1
+
+    # ==================================================================
+    # Helpers
+    # ==================================================================
+
+    @staticmethod
+    def _add_entry(parent, label_text, variable, row):
         ttk.Label(parent, text=label_text).grid(row=row, column=0, sticky=tk.W, pady=2)
-        ttk.Entry(parent, textvariable=variable, width=15).grid(row=row, column=1, sticky=tk.W, padx=5, pady=2)
+        ttk.Entry(parent, textvariable=variable, width=16).grid(row=row, column=1, sticky=tk.W, padx=5, pady=2)
+
+    @staticmethod
+    def _add_sep(parent, row):
+        ttk.Separator(parent, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="ew", pady=8
+        )
+
+    def on_mode_changed(self, event=None):
+        """Switch the visible notebook tab based on mode selection."""
+        mode = self.mode_var.get()
+        if mode == "标准仿真":
+            self.notebook.select(self.page_standard)
+        else:
+            self.notebook.select(self.page_shape)
 
     def browse_dir(self):
         dir_name = filedialog.askdirectory(initialdir=self.outdir_var.get(), title="选择输出目录")
@@ -139,11 +434,9 @@ class HologramGeneratorGUI:
                 if dir_match:
                     max_num = max(max_num, int(dir_match.group(1)))
                     continue
-
                 file_match = file_pattern.match(entry)
                 if file_match:
                     max_num = max(max_num, int(file_match.group(1)))
-
         return f"{max_num + 1:04d}_"
 
     def start_generation(self):
@@ -157,44 +450,76 @@ class HologramGeneratorGUI:
 
     def run_generation(self):
         try:
-            wl = self.wavelength_var.get() * 1e-9
-            dx = self.dx_var.get() * 1e-6
-            dy = self.dy_var.get() * 1e-6
-            n = self.n_var.get()
-
-            dmin = self.dmin_var.get() * 1e-6
-            dmax = self.dmax_var.get() * 1e-6
-            num = self.num_var.get()
-
-            zmin = self.zmin_var.get() * 1e-3
-            zmax = self.zmax_var.get() * 1e-3
-            zstep = self.zstep_var.get() * 1e-6
-
-            snr = self.snr_var.get()
+            mode = self.mode_var.get()
             out_dir = self.outdir_var.get()
-
             prefix = self.get_next_prefix(out_dir)
             run_dir = os.path.join(out_dir, prefix.rstrip("_"))
 
-            saved_dir = generate_hologram(
-                wavelength=wl,
-                dx=dx,
-                dy=dy,
-                N=n,
-                diameter_min=dmin,
-                diameter_max=dmax,
-                num_particles=num,
-                z_min=zmin,
-                z_max=zmax,
-                z_step=zstep,
-                snr_db=snr,
-                output_dir=run_dir,
-                prefix=prefix,
-            )
+            if mode == "标准仿真":
+                saved_dir = self._run_standard(run_dir, prefix)
+            else:
+                saved_dir = self._run_shape(run_dir, prefix)
 
             self.root.after(0, self.generation_complete, True, (prefix, saved_dir))
         except Exception as exc:
+            import traceback
+
+            traceback.print_exc()
             self.root.after(0, self.generation_complete, False, str(exc))
+
+    def _run_standard(self, run_dir, prefix):
+        wl = self.wavelength_var.get() * 1e-9
+        dx = self.dx_var.get() * 1e-6
+        dy = self.dy_var.get() * 1e-6
+        N = self.n_var.get()
+
+        dmin = self.dmin_var.get() * 1e-6
+        dmax = self.dmax_var.get() * 1e-6
+        num = self.num_var.get()
+
+        zmin = self.zmin_var.get() * 1e-3
+        zmax = self.zmax_var.get() * 1e-3
+        zstep = self.zstep_var.get() * 1e-6
+
+        snr = self.snr_var.get()
+
+        return gen_standard(
+            wavelength=wl,
+            dx=dx,
+            dy=dy,
+            N=N,
+            diameter_min=dmin,
+            diameter_max=dmax,
+            num_particles=num,
+            z_min=zmin,
+            z_max=zmax,
+            z_step=zstep,
+            snr_db=snr,
+            output_dir=run_dir,
+            prefix=prefix,
+        )
+
+    def _run_shape(self, run_dir, prefix):
+        return gen_shape(
+            N=self.s_N_var.get(),
+            wavelength_m=self.s_wavelength_var.get() * 1e-9,
+            pixel_size_m=self.s_pixel_var.get() * 1e-6,
+            n_circular=self.s_circular_var.get(),
+            n_irregular=self.s_irregular_var.get(),
+            radius_um_min=self.s_radius_min_var.get(),
+            radius_um_max=self.s_radius_max_var.get(),
+            z_min_m=self.s_zmin_var.get() * 1e-3,
+            z_max_m=self.s_zmax_var.get() * 1e-3,
+            n_particle=self.s_n_particle_var.get(),
+            n_medium=self.s_n_medium_var.get(),
+            attenuation=self.s_attenuation_var.get(),
+            edge_sigma_px=self.s_edge_sigma_var.get(),
+            roughness=self.s_roughness_var.get(),
+            snr_db=self.s_snr_var.get(),
+            output_dir=run_dir,
+            prefix=prefix,
+            seed=self.s_seed_var.get(),
+        )
 
     def generation_complete(self, success, msg):
         self.generate_btn.config(state=tk.NORMAL)

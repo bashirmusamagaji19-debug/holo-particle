@@ -1,14 +1,32 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git init *)",
-      "Bash(git add *)",
-      "Bash(git commit -m '初始提交：项目原始状态 *)",
-      "Bash(where git *)",
-      "Read(//c/Program Files/Git/bin/**)",
-      "Read(//c/Program Files \\(x86\\)/Git/bin/**)",
+      "Bash(git *)",
+      "Bash(ls *)",
+      "Bash(find *)",
+      "Bash(head *)",
+      "Bash(cat *)",
+      "Bash(echo *)",
+      "Bash(cd *)",
+      "Bash(export *)",
+      "Bash(which *)",
+      "Bash(where *)",
       "Bash(cmd.exe *)",
-      "Bash(powershell *)"
+      "Bash(powershell *)",
+      "Bash(python *)",
+      "Bash(pip *)",
+      "Bash(npm *)",
+      "Bash(npx *)",
+      "Bash(curl *)",
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep",
+      "WebSearch",
+      "WebFetch",
+      "Task",
+      "Bash(matlab *)"
     ]
   }
 }
