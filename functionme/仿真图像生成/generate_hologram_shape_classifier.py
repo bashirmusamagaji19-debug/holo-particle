@@ -749,15 +749,21 @@ def compute_complex_transmittance(
     # Binary mask from thickness
     mask_fine = (h_fine > 1e-9).astype(np.float64)
 
-    # ---- Downsample to image resolution ----
-    # Reshape and average over oversample x oversample blocks
-    h_img = h_fine.reshape(ny_img, oversample, nx_img, oversample).mean(axis=(1, 3))
+    # ---- Compute complex transmittance at FINE resolution ----
+    # Phase is highly nonlinear: exp(i * k * dn * h). When h varies by
+    # >> lambda/dn (~1.3 um for dn=0.5) within one image pixel, averaging
+    # the real h first produces a physically wrong random-phase result.
+    # The correct approach is to compute the complex exponential at fine
+    # resolution, then average the COMPLEX values (coherent averaging).
+    phase_fine = k * dn * (h_fine * 1e-6)      # h in um → meters
+    t_fine = np.exp(1j * phase_fine)            # complex, fine grid
+
+    # ---- Downsample complex t to image resolution ----
+    t_img = t_fine.reshape(ny_img, oversample, nx_img, oversample).mean(axis=(1, 3))
+
+    # ---- Mask and amplitude at image resolution ----
     mask_img = mask_fine.reshape(ny_img, oversample, nx_img, oversample).mean(axis=(1, 3))
-
-    # Smooth edge transition at image resolution
     mask_smooth = gaussian_filter(mask_img, sigma=edge_sigma_px)
-
-    # Amplitude: attenuation inside particle, 1 outside
     A = 1.0 - mask_smooth * (1.0 - attenuation)
 
     # Add surface roughness for irregular particles
@@ -767,9 +773,8 @@ def compute_complex_transmittance(
         A = A + roughness_map * mask_smooth
         A = np.clip(A, 0.05, 1.0)
 
-    # Complex transmittance — h_img is in um, convert to meters
-    phase = k * dn * (h_img * 1e-6)
-    t_local = A * np.exp(1j * phase)
+    # Final transmittance: amplitude envelope × complex phase (already averaged)
+    t_local = A * t_img
 
     # Place onto full grid (default t=1 everywhere)
     t_full = np.ones((N, N), dtype=np.complex128)
@@ -1025,11 +1030,11 @@ def generate_hologram(
     radius_um_max: float = 100.0,
     z_min_m: float = 20e-3,
     z_max_m: float = 35e-3,
-    n_particle: float = 1.5,
+    n_particle: float = 1.38,
     n_medium: float = 1.0,
-    attenuation: float = 0.6,
+    attenuation: float = 0.30,
     edge_sigma_px: float = 0.8,
-    roughness: float = 0.03,
+    roughness: float = 0.0,
     snr_db: float = 0.0,
     poly_radial_jitter: float = 0.40,
     poly_spike_fraction: float = 0.12,
@@ -1255,11 +1260,11 @@ Examples:
     p.add_argument("--radius-max", type=float, default=100.0, help="Max particle radius (um).")
     p.add_argument("--z-min", type=float, default=20.0, help="Min depth (mm).")
     p.add_argument("--z-max", type=float, default=35.0, help="Max depth (mm).")
-    p.add_argument("--n-particle", type=float, default=1.5, help="Particle refractive index.")
+    p.add_argument("--n-particle", type=float, default=1.38, help="Particle refractive index.")
     p.add_argument("--n-medium", type=float, default=1.0, help="Medium refractive index.")
-    p.add_argument("--attenuation", type=float, default=0.6, help="Amplitude attenuation in particle.")
+    p.add_argument("--attenuation", type=float, default=0.30, help="Amplitude attenuation in particle.")
     p.add_argument("--edge-sigma", type=float, default=0.8, help="Edge blur sigma (pixels).")
-    p.add_argument("--roughness", type=float, default=0.03, help="Surface roughness std (irregular only).")
+    p.add_argument("--roughness", type=float, default=0.0, help="Surface roughness std (irregular only, 0=off).")
     p.add_argument("--snr", type=float, default=0.0, help="Noise SNR (dB). 0=no noise.")
     p.add_argument("--fragmentation", choices=["custom", "mild", "medium", "severe"], default="custom",
                    help="Polyhedron fragmentation preset (overrides --poly-*).")

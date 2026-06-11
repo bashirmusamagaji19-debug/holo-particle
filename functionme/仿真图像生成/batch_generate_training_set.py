@@ -40,9 +40,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed-start", type=int, default=1, help="Starting seed (incremented per hologram).")
     p.add_argument("--wavelength", type=float, default=638e-9, help="Wavelength (m).")
     p.add_argument("--pixel-size", type=float, default=3.45e-6, help="Pixel size (m).")
-    p.add_argument("--n-particle", type=float, default=1.5, help="Particle refractive index.")
-    p.add_argument("--attenuation", type=float, default=0.6, help="Amplitude attenuation.")
-    p.add_argument("--roughness", type=float, default=0.03, help="Surface roughness std.")
+    p.add_argument("--n-particle", type=float, default=1.38, help="Particle refractive index.")
+    p.add_argument("--attenuation", type=float, default=0.30, help="Amplitude attenuation.")
+    p.add_argument("--roughness", type=float, default=0.0, help="Surface roughness std (0=off).")
     return p.parse_args()
 
 

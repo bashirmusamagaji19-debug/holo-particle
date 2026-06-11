@@ -293,9 +293,9 @@ class HologramGeneratorGUI:
         )
         row += 1
 
-        self.s_n_particle_var = tk.DoubleVar(value=1.5)
+        self.s_n_particle_var = tk.DoubleVar(value=1.38)
         self.s_n_medium_var = tk.DoubleVar(value=1.0)
-        self.s_attenuation_var = tk.DoubleVar(value=0.6)
+        self.s_attenuation_var = tk.DoubleVar(value=0.30)
 
         self._add_entry(scroll_frame, "粒子折射率 n:", self.s_n_particle_var, row)
         row += 1
@@ -334,7 +334,7 @@ class HologramGeneratorGUI:
         row += 1
 
         self.s_edge_sigma_var = tk.DoubleVar(value=0.8)
-        self.s_roughness_var = tk.DoubleVar(value=0.03)
+        self.s_roughness_var = tk.DoubleVar(value=0.0)
 
         self._add_entry(scroll_frame, "边缘模糊 sigma (px):", self.s_edge_sigma_var, row)
         ttk.Label(scroll_frame, text="(粒子边缘高斯过渡宽度)", foreground="gray").grid(
