@@ -176,7 +176,8 @@ function [summary, stat] = iFastStatsCpuCore(holo, zVec, lambda, pixel, params)
         [batchMax, localArgmax] = max(I, [], 3);
         updateMask = batchMax > mip2D;
         mip2D(updateMask) = batchMax(updateMask);
-        argmaxZMap(updateMask) = uint16(idx(1) - 1) + uint16(localArgmax);
+        batchArgmax = uint16(idx(1) - 1) + uint16(localArgmax);
+        argmaxZMap(updateMask) = batchArgmax(updateMask);
     end
     stat.mipSec = toc(tMip);
 
@@ -333,6 +334,11 @@ function summary = iFinalizeSummaryFromMaps(candidateData, focusIdx, peakRatioAp
     summary.volumeSize = volumeSize;
     summary.hasVolume = false;
     summary.validMask = validMask;
+    % Diagnostic: pass through dual-threshold masks if present
+    if isfield(candidateData, 'bwLow')
+        summary.bwLow  = candidateData.bwLow;
+        summary.bwHigh = candidateData.bwHigh;
+    end
     summary.candidateCoords3D = coords3D;
     summary.candidateRoiBoxes = candidateData.roiBoxes;
     summary.candidateStats = stats;
@@ -356,6 +362,10 @@ function out = iEmptySummary(candidateData, zVec, volumeSize)
     out.volumeSize = volumeSize;
     out.hasVolume = false;
     out.validMask = false(0, 1);
+    if isfield(candidateData, 'bwLow')
+        out.bwLow  = candidateData.bwLow;
+        out.bwHigh = candidateData.bwHigh;
+    end
     out.candidateCoords3D = zeros(0, 3);
     out.candidateRoiBoxes = zeros(0, 4);
     out.candidateStats = struct([]);
@@ -370,66 +380,231 @@ function out = iDetectCandidates(mip2D, params)
     img2D = AS_normalizeImage(mip2D);
     level = min(max(params.xyThreshold, 0), 1);
 
+    isSim = isfield(params, 'simulationMode') && params.simulationMode;
+
+    % ---- Binarization (common) ----
     bw = imfill(bwareaopen(imbinarize(img2D, level), 3), 'holes');
-    D = -bwdist(~bw);
-    mask = imextendedmin(D, params.watershedHmin);
-    D2 = imimposemin(D, mask);
-    L_watershed = watershed(D2);
-    bw(L_watershed == 0) = 0;
 
-    stats_raw = regionprops(bw, img2D, 'Centroid', 'WeightedCentroid', ...
-        'EquivDiameter', 'BoundingBox', 'Area', 'Perimeter');
+    if isSim
+        % ============================================================
+        %  Simulation: dual-threshold + conditional marker watershed.
+        %
+        %  lowLevel  — captures full particle extent (weak bridges +
+        %              extended protrusions of irregular particles).
+        %  highLevel — bright nuclei used as markers.
+        %
+        %  For each low-threshold connected component:
+        %    1 marker  → keep whole  (single irregular particle, no split)
+        %    N markers → marker-controlled watershed  (N nearby particles
+        %                 that merged in the low mask)
+        %  Guards: markers must be ≥ minSepPx apart; component must be
+        %          larger than a single expected particle area.
+        % ============================================================
 
-    out = struct();
-    out.img2D = img2D;
-    out.mip2D = mip2D;
-    out.bw = bw;
+        highLevel = params.xyThreshold;
+        lowLevel  = max(0.12, 0.40 * highLevel);
 
-    if isempty(stats_raw)
-        out.stats = struct([]);
-        out.roiBoxes = zeros(0, 4);
-        out.candidates = struct('centerXY', {}, 'x1', {}, 'x2', {}, 'y1', {}, 'y2', {}, ...
-            'roiBox', {}, 'cxLocal', {}, 'cyLocal', {});
-        return;
-    end
+        bwHigh = imbinarize(img2D, highLevel);
+        bwLow  = imbinarize(img2D, lowLevel);
 
-    all_diams = [stats_raw.EquivDiameter];
-    all_areas = [stats_raw.Area];
-    all_perimeters = [stats_raw.Perimeter];
-    circularity = (4 * pi * all_areas) ./ (all_perimeters.^2 + eps);
-    keep_idx = (all_diams >= params.minDiamPx) & (all_diams <= params.maxDiamPx) ...
-             & (circularity > params.minCircularity);
-    stats = stats_raw(keep_idx);
+        bwLow = imclose(bwLow, strel('disk', 4));
+        bwLow = imfill(bwLow, 'holes');
+        bwLow = bwareaopen(bwLow, 3);
 
-    L_conn = labelmatrix(bwconncomp(bw));
-    bw = ismember(L_conn, find(keep_idx));
+        % ---- Conditional marker watershed per component ----
+        Llow = bwlabel(bwLow, 8);
+        nComp = max(Llow(:));
+        bwFinal = false(size(bwLow));
 
-    out.stats = stats;
-    out.roiBoxes = zeros(numel(stats), 4);
-    out.candidates = repmat(struct('centerXY', [], 'x1', 1, 'x2', 1, 'y1', 1, 'y2', 1, ...
-        'roiBox', [1 1 1 1], 'cxLocal', 1, 'cyLocal', 1), numel(stats), 1);
+        % Guard thresholds
+        %   minSepPx: markers must be ≥ this far apart to be considered
+        %             separate particles.  For 50 um particles at 3.45 um/px
+        %             this is ~22 px (~75 um).  An irregular single particle
+        %             would rarely have internal bright spots this far apart.
+        minSepPx = max(15, params.minDiamPx * 1.2);
+        %   minAreaForSplit: component must be large enough to plausibly
+        %                    contain two minimum-diameter particles.
+        minAreaForSplit = 2.2 * pi * (0.5 * params.minDiamPx)^2;
 
-    for n = 1:numel(stats)
-        centerXY = stats(n).WeightedCentroid;
-        if any(~isfinite(centerXY))
-            centerXY = stats(n).Centroid;
+        for id = 1:nComp
+            comp = (Llow == id);
+            compArea = sum(comp(:));
+
+            % Markers inside this component
+            compMarkers = bwHigh & comp;
+            compMarkers = bwareaopen(compMarkers, 3);
+            Lm = bwlabel(compMarkers, 8);
+            nMarks = max(Lm(:));
+
+            if nMarks <= 1
+                bwFinal = bwFinal | comp;
+                continue;
+            end
+
+            % Multiple markers — check if truly distinct particles
+            markerProps = regionprops(Lm, 'Centroid');
+            centroids = cat(1, markerProps.Centroid);
+            dx = centroids(:,1) - centroids(:,1)';
+            dy = centroids(:,2) - centroids(:,2)';
+            dists = sqrt(dx.^2 + dy.^2);
+            dists = dists(triu(true(size(dists)), 1));
+
+            if isempty(dists) || min(dists) < minSepPx || compArea < minAreaForSplit
+                bwFinal = bwFinal | comp;
+                continue;
+            end
+
+            % Attempt marker-controlled watershed within this component
+            D = -bwdist(~comp);
+            D(~comp) = Inf;
+            D2 = imimposemin(D, Lm > 0);
+            Lw = watershed(D2);
+            splitMask = comp;
+            splitMask(Lw == 0) = 0;
+
+            % ---- Fragment check: undo split if any piece is too small ----
+            fragProps = regionprops(splitMask, 'EquivDiameter');
+            fragDiams = [fragProps.EquivDiameter];
+            if any(fragDiams < params.minDiamPx)
+                % At least one fragment is below the minimum particle size
+                % → this was an irregular single particle, not a cluster
+                bwFinal = bwFinal | comp;
+            else
+                bwFinal = bwFinal | splitMask;
+            end
         end
 
-        cx = round(centerXY(1));
-        cy = round(centerXY(2));
-        candidate = struct('centerXY', centerXY, 'equivDiameterPx', stats(n).EquivDiameter, ...
-            'bboxSizePx', [stats(n).BoundingBox(3), stats(n).BoundingBox(4)]);
-        roiInfo = AS_buildAdaptiveROI(img2D, candidate, params);
+        bw = bwFinal;
 
-        out.roiBoxes(n, :) = roiInfo.searchBox;
-        out.candidates(n).centerXY = centerXY;
-        out.candidates(n).x1 = roiInfo.searchBox(1);
-        out.candidates(n).y1 = roiInfo.searchBox(2);
-        out.candidates(n).x2 = out.candidates(n).x1 + roiInfo.searchBox(3) - 1;
-        out.candidates(n).y2 = out.candidates(n).y1 + roiInfo.searchBox(4) - 1;
-        out.candidates(n).roiBox = out.roiBoxes(n, :);
-        out.candidates(n).cxLocal = min(out.candidates(n).x2 - out.candidates(n).x1 + 1, max(1, cx - out.candidates(n).x1 + 1));
-        out.candidates(n).cyLocal = min(out.candidates(n).y2 - out.candidates(n).y1 + 1, max(1, cy - out.candidates(n).y1 + 1));
+        stats_raw = regionprops(bw, img2D, 'Centroid', 'WeightedCentroid', ...
+            'EquivDiameter', 'BoundingBox', 'Area', 'Perimeter');
+
+        out = struct();
+        out.img2D = img2D;
+        out.mip2D = mip2D;
+        out.bw = bw;
+        out.bwLow  = bwLow;   % diagnostic: low-threshold mask
+        out.bwHigh = bwHigh;  % diagnostic: high-threshold mask
+
+        if isempty(stats_raw)
+            out.stats = struct([]);
+            out.roiBoxes = zeros(0, 4);
+            out.candidates = struct('centerXY', {}, 'x1', {}, 'x2', {}, 'y1', {}, 'y2', {}, ...
+                'roiBox', {}, 'cxLocal', {}, 'cyLocal', {});
+            return;
+        end
+
+        % Filter by diameter only (no circularity)
+        all_diams = [stats_raw.EquivDiameter];
+        keep_idx = (all_diams >= params.minDiamPx) & (all_diams <= params.maxDiamPx);
+        stats = stats_raw(keep_idx);
+
+        L_conn = labelmatrix(bwconncomp(bw));
+        bw = ismember(L_conn, find(keep_idx));
+
+        out.stats = stats;
+        nCand = numel(stats);
+        out.roiBoxes = zeros(nCand, 4);
+        out.candidates = repmat(struct('centerXY', [], 'x1', 1, 'x2', 1, 'y1', 1, 'y2', 1, ...
+            'roiBox', [1 1 1 1], 'cxLocal', 1, 'cyLocal', 1), nCand, 1);
+
+        [ny, nx] = size(img2D);
+        for n = 1:nCand
+            centerXY = stats(n).WeightedCentroid;
+            if any(~isfinite(centerXY))
+                centerXY = stats(n).Centroid;
+            end
+            cx = round(centerXY(1));
+            cy = round(centerXY(2));
+
+            % ---- BoundingBox + fixed margin (no edge-energy expansion) ----
+            bbox = stats(n).BoundingBox;
+            marginPx = max(8, round(0.35 * max(bbox(3), bbox(4))));
+            if isfield(params, 'searchMinRadiusUm') && isfield(params, 'pix_um')
+                marginPx = max(marginPx, round(params.searchMinRadiusUm / params.pix_um));
+            end
+
+            x1 = max(1, floor(bbox(1)) - marginPx);
+            y1 = max(1, floor(bbox(2)) - marginPx);
+            x2 = min(nx, ceil(bbox(1) + bbox(3)) + marginPx);
+            y2 = min(ny, ceil(bbox(2) + bbox(4)) + marginPx);
+
+            out.roiBoxes(n, :) = [x1, y1, x2 - x1 + 1, y2 - y1 + 1];
+            out.candidates(n).centerXY = centerXY;
+            out.candidates(n).x1 = x1;
+            out.candidates(n).y1 = y1;
+            out.candidates(n).x2 = x2;
+            out.candidates(n).y2 = y2;
+            out.candidates(n).roiBox = out.roiBoxes(n, :);
+            out.candidates(n).cxLocal = min(x2 - x1 + 1, max(1, cx - x1 + 1));
+            out.candidates(n).cyLocal = min(y2 - y1 + 1, max(1, cy - y1 + 1));
+        end
+
+    else
+        % ============================================================
+        %  Experimental mode: watershed + adaptive ROI (unchanged)
+        % ============================================================
+
+        D = -bwdist(~bw);
+        mask = imextendedmin(D, params.watershedHmin);
+        D2 = imimposemin(D, mask);
+        L_watershed = watershed(D2);
+        bw(L_watershed == 0) = 0;
+
+        stats_raw = regionprops(bw, img2D, 'Centroid', 'WeightedCentroid', ...
+            'EquivDiameter', 'BoundingBox', 'Area', 'Perimeter');
+
+        out = struct();
+        out.img2D = img2D;
+        out.mip2D = mip2D;
+        out.bw = bw;
+
+        if isempty(stats_raw)
+            out.stats = struct([]);
+            out.roiBoxes = zeros(0, 4);
+            out.candidates = struct('centerXY', {}, 'x1', {}, 'x2', {}, 'y1', {}, 'y2', {}, ...
+                'roiBox', {}, 'cxLocal', {}, 'cyLocal', {});
+            return;
+        end
+
+        all_diams = [stats_raw.EquivDiameter];
+        all_areas = [stats_raw.Area];
+        all_perimeters = [stats_raw.Perimeter];
+        circularity = (4 * pi * all_areas) ./ (all_perimeters.^2 + eps);
+        keep_idx = (all_diams >= params.minDiamPx) & (all_diams <= params.maxDiamPx) ...
+                 & (circularity > params.minCircularity);
+        stats = stats_raw(keep_idx);
+
+        L_conn = labelmatrix(bwconncomp(bw));
+        bw = ismember(L_conn, find(keep_idx));
+
+        out.stats = stats;
+        out.roiBoxes = zeros(numel(stats), 4);
+        out.candidates = repmat(struct('centerXY', [], 'x1', 1, 'x2', 1, 'y1', 1, 'y2', 1, ...
+            'roiBox', [1 1 1 1], 'cxLocal', 1, 'cyLocal', 1), numel(stats), 1);
+
+        for n = 1:numel(stats)
+            centerXY = stats(n).WeightedCentroid;
+            if any(~isfinite(centerXY))
+                centerXY = stats(n).Centroid;
+            end
+
+            cx = round(centerXY(1));
+            cy = round(centerXY(2));
+            candidate = struct('centerXY', centerXY, 'equivDiameterPx', stats(n).EquivDiameter, ...
+                'bboxSizePx', [stats(n).BoundingBox(3), stats(n).BoundingBox(4)]);
+            roiInfo = AS_buildAdaptiveROI(img2D, candidate, params);
+
+            out.roiBoxes(n, :) = roiInfo.searchBox;
+            out.candidates(n).centerXY = centerXY;
+            out.candidates(n).x1 = roiInfo.searchBox(1);
+            out.candidates(n).y1 = roiInfo.searchBox(2);
+            out.candidates(n).x2 = out.candidates(n).x1 + roiInfo.searchBox(3) - 1;
+            out.candidates(n).y2 = out.candidates(n).y1 + roiInfo.searchBox(4) - 1;
+            out.candidates(n).roiBox = out.roiBoxes(n, :);
+            out.candidates(n).cxLocal = min(out.candidates(n).x2 - out.candidates(n).x1 + 1, max(1, cx - out.candidates(n).x1 + 1));
+            out.candidates(n).cyLocal = min(out.candidates(n).y2 - out.candidates(n).y1 + 1, max(1, cy - out.candidates(n).y1 + 1));
+        end
     end
 end
 

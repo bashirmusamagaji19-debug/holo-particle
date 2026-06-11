@@ -698,6 +698,38 @@ function VolumeGUI_AngularSpectrum
         handles.ParticleAxialCurves = fastStats.axialCurves;
         handles = iRefreshUiState(handles);
         guidata(hFig, handles);
+
+        % --- 仿真模式：显示双阈值诊断图 ---
+        if simulationMode && isfield(fastStats, 'bwLow')
+            hDiag = figure('Name', '候选检测诊断 — 双阈值分割', ...
+                'NumberTitle', 'off', 'Position', [150 120 1100 520]);
+            % 归一化 MIP
+            ax1 = subplot(2,3,1); imshow(fastStats.img2D, []); title('归一化 MIP'); colorbar;
+            % 低阈值二值化
+            ax2 = subplot(2,3,2); imshow(fastStats.bwLow);  title(sprintf('低阈值 (联动区域)'));
+            % 高阈值二值化
+            ax3 = subplot(2,3,3); imshow(fastStats.bwHigh); title(sprintf('高阈值 (亮核)'));
+            % 最终 mask + 候选框
+            ax4 = subplot(2,3,4);
+            imshow(fastStats.img2D, []); hold on;
+            visboundaries(fastStats.bw, 'Color', 'g', 'LineWidth', 0.5);
+            title(sprintf('最终 Mask (%d 候选)', size(fastStats.candidateRoiBoxes, 1)));
+            % 高阈值叠加在 MIP 上
+            ax5 = subplot(2,3,5);
+            imshow(fastStats.img2D, []); hold on;
+            bwOverlay = imoverlay(mat2gray(fastStats.img2D), fastStats.bwHigh, [1 0 0]);
+            imshow(bwOverlay); title('MIP + 高阈值(红)');
+            % 候选框画在 MIP 上
+            ax6 = subplot(2,3,6);
+            imshow(fastStats.img2D, []); hold on;
+            for nb = 1:size(fastStats.candidateRoiBoxes, 1)
+                rectangle('Position', fastStats.candidateRoiBoxes(nb,:), ...
+                    'EdgeColor', 'g', 'LineWidth', 1);
+            end
+            title('MIP + 候选 ROI 框');
+            linkaxes([ax1 ax2 ax3 ax4 ax5 ax6]);
+        end
+
         onSimpleStatsV2([], []); % 直接调用统计显示
         return;
     end
@@ -1662,28 +1694,23 @@ function VolumeGUI_AngularSpectrum
         roiBoxes = statsResult.candidateRoiBoxes;
         validMask = logical(statsResult.candidateValidMask(:));
 
-        % --- 替换掉原来画 roiBoxes 的循环 ---
-        % 直接使用最终统计出来的精确坐标和直径来画紧凑框
-        coordsPx = statsResult.coordsPx; 
-        diamsPx = statsResult.diamsPx;
-        
-        for n = 1:size(coordsPx, 1)
-            cx = coordsPx(n, 1);
-            cy = coordsPx(n, 2);
-            d  = diamsPx(n);
-            r  = d / 2;
-            
-            % 根据真实粒径计算紧贴粒子的矩形框 [x, y, w, h]
-            tightBox = [cx - r, cy - r, d, d];
-            
-            boxColor = [0.20 0.95 0.55]; % 绿色：有效
-            
-            % 画紧贴粒子的框
-            rectangle(axMip, 'Position', tightBox, 'EdgeColor', boxColor, 'LineWidth', 1.5);
-            
-            % 标上序号
-            text(axMip, cx + r + 2, cy - r - 2, sprintf('%d', n), ...
-                 'Color', boxColor, 'FontSize', 10, 'FontWeight', 'bold', 'Parent', axMip);
+        % --- 画候选 ROI 框 (candidateRoiBoxes)，而不是等效直径方框 ---
+        % 仿真模式下 ROI = BoundingBox + margin，实验模式下 ROI = 自适应扩展。
+        % 用 candidateRoiBoxes 才能看到真实候选区域是否完整框住粒子。
+        validCount = 0;
+        for n = 1:size(roiBoxes, 1)
+            if validMask(n)
+                boxColor = [0.20 0.95 0.55];  % green: valid
+                validCount = validCount + 1;
+            else
+                boxColor = [1.00 0.65 0.20];  % orange: rejected
+            end
+            rectangle(axMip, 'Position', roiBoxes(n, :), ...
+                'EdgeColor', boxColor, 'LineWidth', 1.5);
+
+            % Label at top-left corner of each box
+            text(axMip, roiBoxes(n, 1) + 2, roiBoxes(n, 2) - 4, sprintf('%d', n), ...
+                'Color', boxColor, 'FontSize', 10, 'FontWeight', 'bold', 'Parent', axMip);
         end
 
         validCount = sum(validMask);
