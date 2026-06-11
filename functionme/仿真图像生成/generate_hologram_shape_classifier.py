@@ -280,27 +280,34 @@ class AggregateShape:
 
 @dataclass
 class PolyhedronShape:
-    """Irregular particle — convex polyhedron (like ice crystal fragment).
+    """Irregular particle — chipped polyhedron (like ice crystal fragment).
 
-    Generates a star-shaped point cloud by assigning strongly varying random
-    radii to uniformly distributed directions, then takes the convex hull.
-    The result has flat faces of varying size, sharp edges, and protruding
-    spike vertices — ideal for ice-crystal / mineral-fragment morphology.
+    1. Generates a star-shaped point cloud → ConvexHull → base polyhedron.
+    2. Randomly chips off corners by intersecting with additional half-spaces,
+       producing a NON-CONVEX shape with flat truncation facets, notches,
+       and re-entrant angles — like fractured mineral grains.
 
     Parameters
     ----------
     target_radius_um : float
         Nominal radius scale.
     num_vertices : int
-        Number of direction vectors (hull vertices will be a subset of these).
+        Number of direction vectors for the base convex hull.
     aspect_ratio : tuple
         (ax, ay, az) stretch factors for plate/columnar habits.
     radial_jitter : float
-        Controls regular-point radius variation: radius ∈ [1-jitter, 1+jitter].
+        Regular-point radius variation: radius ∈ [1-jitter, 1+jitter].
     spike_fraction : float
         Fraction of points pushed to 1.6–2.5× radius (extreme protrusions).
     indent_fraction : float
         Fraction of points pulled to 0.25–0.65× radius (recessed → large facets).
+    num_chips : int
+        Number of corner-truncation planes to apply after the hull.
+        Each chip removes a wedge of material near a hull vertex, creating
+        flat cleavage-like facets and non-convex features.  0 = pure convex.
+    chip_depth : float
+        Mean depth of chips as a fraction of vertex distance from centroid
+        (~0.10 = shallow edge damage, ~0.35 = deep truncation).
     """
     target_radius_um: float
     num_vertices: int
@@ -308,7 +315,10 @@ class PolyhedronShape:
     radial_jitter: float = 0.40
     spike_fraction: float = 0.12
     indent_fraction: float = 0.20
+    num_chips: int = 6
+    chip_depth: float = 0.22
     _hull_vertices: np.ndarray = field(default=None, repr=False)
+    _clip_planes: np.ndarray = field(default=None, repr=False)
     _volume_um3: float = field(default=None, repr=False)
     _thickness_map: np.ndarray = field(default=None, repr=False)
     _voxel_centers: np.ndarray = field(default=None, repr=False)
@@ -327,57 +337,74 @@ class PolyhedronShape:
         n_indent = int(n * self.indent_fraction)
         n_regular = n - n_spike - n_indent
 
-        # Shuffle category assignment so they are spatially mixed
-        categories = np.array(
-            [0] * n_regular + [1] * n_indent + [2] * n_spike
-        )
+        categories = np.array([0] * n_regular + [1] * n_indent + [2] * n_spike)
         rng.shuffle(categories)
 
         # ---- 3. Assign random radii by category ----
         radii = np.ones(n) * self.target_radius_um
 
-        # Regular: moderate random variation around target radius
         mask_reg = categories == 0
         if mask_reg.any():
             radii[mask_reg] = self.target_radius_um * rng.uniform(
                 1.0 - self.radial_jitter, 1.0 + self.radial_jitter,
-                size=mask_reg.sum(),
-            )
+                size=mask_reg.sum())
 
-        # Indented: pulled inward → these form large flat facet surfaces
         mask_ind = categories == 1
         if mask_ind.any():
             radii[mask_ind] = self.target_radius_um * rng.uniform(
-                0.25, 0.65, size=mask_ind.sum(),
-            )
+                0.25, 0.65, size=mask_ind.sum())
 
-        # Spikes: pushed far outward → sharp protruding vertices
         mask_spike = categories == 2
         if mask_spike.any():
             radii[mask_spike] = self.target_radius_um * rng.uniform(
-                1.6, 2.5, size=mask_spike.sum(),
-            )
+                1.6, 2.5, size=mask_spike.sum())
 
-        # ---- 4. Scale directions by radii → star-shaped point cloud ----
+        # ---- 4. Scale directions → star-shaped point cloud ----
         points = directions * radii.reshape(-1, 1)
-
-        # Apply aspect ratio stretching
         points[:, 0] *= ax
         points[:, 1] *= ay
         points[:, 2] *= az
 
-        # ---- 5. Convex hull → faceted polyhedron ----
+        # ---- 5. Convex hull → base polyhedron ----
         try:
             hull = ConvexHull(points)
             self._hull_vertices = points[hull.vertices]
-            self._volume_um3 = hull.volume
         except Exception:
             self._hull_vertices = points
-            self._volume_um3 = (4.0 / 3.0) * np.pi * self.target_radius_um**3
 
-        # ---- 6. Voxelize ----
+        # ---- 6. Generate corner-chip clipping planes ----
+        clip_planes = []
+        if self.num_chips > 0 and len(self._hull_vertices) >= 6:
+            vertices = self._hull_vertices
+            centroid = np.mean(vertices, axis=0)
+
+            # Pick random vertices to chip (avoid chipping all — keep some shape)
+            n_actual = min(self.num_chips, len(vertices) // 2)
+            chip_idx = rng.choice(len(vertices), size=n_actual, replace=False)
+
+            for idx in chip_idx:
+                v = vertices[idx]
+                direction = v - centroid
+                dist = np.linalg.norm(direction)
+                if dist < 1e-9:
+                    continue
+                outward = direction / dist
+
+                # Place the clip plane between the centroid and the vertex.
+                # depth = fraction of the vertex-centroid distance.
+                # Keep the side toward centroid (remove the corner).
+                d = rng.uniform(0.6, 1.4) * self.chip_depth
+                p = centroid + (1.0 - d) * direction   # point on plane
+                plane_d = -np.dot(outward, p)          # outward·x + plane_d <= 0 → KEEP
+
+                clip_planes.append([outward[0], outward[1], outward[2], plane_d])
+
+        if clip_planes:
+            self._clip_planes = np.array(clip_planes)
+
+        # ---- 7. Voxelize with clip constraints ----
         self._thickness_map, self._volume_um3, self._voxel_centers = (
-            _voxelize_convex_hull(self._hull_vertices, voxel_um)
+            _voxelize_chipped_hull(self._hull_vertices, self._clip_planes, voxel_um)
         )
 
     def get_thickness_map(self, x_um: np.ndarray, y_um: np.ndarray) -> np.ndarray:
@@ -415,25 +442,30 @@ class PolyhedronShape:
             "radial_jitter": self.radial_jitter,
             "spike_fraction": self.spike_fraction,
             "indent_fraction": self.indent_fraction,
+            "num_chips": self.num_chips,
+            "chip_depth": self.chip_depth,
         }
 
 
 
-def _voxelize_convex_hull(
+def _voxelize_chipped_hull(
     hull_vertices: np.ndarray,
+    clip_planes: np.ndarray | None,
     voxel_um: float,
     padding_um: float = 5.0,
 ) -> tuple[np.ndarray, float, np.ndarray]:
-    """Voxelize a convex hull via slice-by-slice half-space testing.
+    """Voxelize a convex hull with optional corner-chip clipping planes.
 
-    Avoids 3D meshgrid — for each z-slice, tests all (x,y) against the
-    hull's face equations using vectorized 2D operations.
-    Memory: O(N^2) instead of O(N^3).
+    The shape is: convex_hull ∩ clip_plane_1 ∩ clip_plane_2 ∩ ...
 
-    Returns:
-        thickness_map_um: 2D array — thickness along z at each (x,y)
-        volume_um3: float
-        voxel_centers: 1D array
+    Each clip plane equation (A,B,C,D) keeps points where A*x+B*y+C*z+D <= 0
+    (i.e., the side toward the centroid). Points on the outward side are removed,
+    creating flat truncation facets and non-convex features.
+
+    When clip_planes is None or empty, this degenerates to pure convex hull
+    voxelization.
+
+    Slice-by-slice 2D processing — memory O(N^2).
     """
     extent = np.max(np.abs(hull_vertices)) + padding_um
     n_voxels = int(np.ceil(2 * extent / voxel_um))
@@ -442,22 +474,32 @@ def _voxelize_convex_hull(
 
     voxel_centers = (np.arange(n_voxels) - n_voxels // 2) * voxel_um
 
-    # Precompute half-space equations
+    # Precompute convex hull half-space equations
     hull = ConvexHull(hull_vertices)
-    eq = hull.equations  # (F, 4): A*x + B*y + C*z + D <= 0 inside
+    eq = hull.equations  # (F, 4): A*x + B*y + C*z + D <= 0 for inside
 
-    # Single 2D meshgrid reused for every z-slice
+    # Single 2D meshgrid for all z-slices
     X2D, Y2D = np.meshgrid(voxel_centers, voxel_centers, indexing="ij")
+
+    has_clips = clip_planes is not None and len(clip_planes) > 0
 
     thickness_map_um = np.zeros((n_voxels, n_voxels), dtype=np.float64)
     total_occupied = 0
 
     for z in voxel_centers:
         occupied_2d = np.ones((n_voxels, n_voxels), dtype=bool)
+
+        # Hull face constraints
         for face_eq in eq:
             A, B, C, D = face_eq
-            lhs = A * X2D + B * Y2D + C * z + D
-            occupied_2d &= lhs <= 1e-9
+            occupied_2d &= (A * X2D + B * Y2D + C * z + D) <= 1e-9
+
+        # Clip plane constraints: remove material beyond each plane
+        if has_clips:
+            for clip_eq in clip_planes:
+                A, B, C, D = clip_eq
+                occupied_2d &= (A * X2D + B * Y2D + C * z + D) <= 1e-9
+
         thickness_map_um += occupied_2d.astype(np.float64)
         total_occupied += int(occupied_2d.sum())
 
@@ -502,6 +544,8 @@ def place_particles(
     poly_indent_fraction: float = 0.20,
     poly_vertex_min: int = 15,
     poly_vertex_max: int = 35,
+    poly_num_chips: int = 6,
+    poly_chip_depth: float = 0.22,
     max_attempts: int = 5000,
 ) -> list[Particle]:
     """Place particles on the image plane without overlap.
@@ -572,6 +616,8 @@ def place_particles(
                     jit = poly_radial_jitter * rng.uniform(0.7, 1.3)
                     spk = np.clip(poly_spike_fraction * rng.uniform(0.7, 1.3), 0.03, 0.30)
                     ind = np.clip(poly_indent_fraction * rng.uniform(0.7, 1.3), 0.05, 0.35)
+                    n_chips = rng.integers(max(0, poly_num_chips - 2), poly_num_chips + 3)
+                    cd = poly_chip_depth * rng.uniform(0.7, 1.4)
                     shape = PolyhedronShape(
                         target_radius_um=radius_um,
                         num_vertices=n_vertices,
@@ -579,6 +625,8 @@ def place_particles(
                         radial_jitter=jit,
                         spike_fraction=spk,
                         indent_fraction=ind,
+                        num_chips=n_chips,
+                        chip_depth=cd,
                     )
                     shape.initialize(rng, voxel_um=_adaptive_voxel_um(radius_um))
 
@@ -961,6 +1009,8 @@ def generate_hologram(
     poly_indent_fraction: float = 0.20,
     poly_vertex_min: int = 15,
     poly_vertex_max: int = 35,
+    poly_num_chips: int = 6,
+    poly_chip_depth: float = 0.22,
     fragmentation: str = "",
     output_dir: str = "./output/0001",
     prefix: str = "",
@@ -1036,15 +1086,18 @@ def generate_hologram(
 
     # ---- Fragmentation preset (overrides individual polyhedron params) ----
     frag_presets = {
-        "mild":    (0.25, 0.06, 0.10, 12, 22),   # (jitter, spike, indent, v_min, v_max)
-        "medium":  (0.40, 0.12, 0.20, 15, 35),
-        "severe":  (0.55, 0.20, 0.30, 20, 45),
+        # (jitter, spike, indent, v_min, v_max, num_chips, chip_depth)
+        "mild":    (0.25, 0.06, 0.10, 12, 22,  3, 0.12),
+        "medium":  (0.40, 0.12, 0.20, 15, 35,  6, 0.22),
+        "severe":  (0.55, 0.20, 0.30, 20, 45, 10, 0.35),
     }
     fragmentation_mode = fragmentation.lower() if fragmentation else "custom"
     if fragmentation_mode in frag_presets:
         p = frag_presets[fragmentation_mode]
-        poly_radial_jitter, poly_spike_fraction, poly_indent_fraction, poly_vertex_min, poly_vertex_max = p
-        print(f"  多面体破碎度: {fragmentation_mode} (jitter={poly_radial_jitter}, spike={poly_spike_fraction}, indent={poly_indent_fraction})")
+        (poly_radial_jitter, poly_spike_fraction, poly_indent_fraction,
+         poly_vertex_min, poly_vertex_max, poly_num_chips, poly_chip_depth) = p
+        print(f"  多面体破碎度: {fragmentation_mode} (jitter={poly_radial_jitter}, spike={poly_spike_fraction}, "
+              f"indent={poly_indent_fraction}, chips={poly_num_chips}, chip_depth={poly_chip_depth})")
     elif fragmentation_mode != "custom":
         raise ValueError(
             "fragmentation must be one of: custom, mild, medium, severe"
@@ -1065,6 +1118,8 @@ def generate_hologram(
         poly_indent_fraction=poly_indent_fraction,
         poly_vertex_min=poly_vertex_min,
         poly_vertex_max=poly_vertex_max,
+        poly_num_chips=poly_num_chips,
+        poly_chip_depth=poly_chip_depth,
     )
     n_sphere = sum(1 for p in particles if p.shape_type == "sphere")
     n_agg = sum(1 for p in particles if p.shape_type == "aggregate")
@@ -1189,6 +1244,10 @@ Examples:
                    help="Min polyhedron direction vectors.")
     p.add_argument("--poly-vertex-max", type=int, default=35,
                    help="Max polyhedron direction vectors.")
+    p.add_argument("--poly-num-chips", type=int, default=6,
+                   help="Number of corner-chip planes (0 = pure convex).")
+    p.add_argument("--poly-chip-depth", type=float, default=0.22,
+                   help="Mean chip depth as fraction of vertex distance.")
     return p.parse_args()
 
 
@@ -1215,6 +1274,8 @@ if __name__ == "__main__":
         poly_indent_fraction=args.poly_indent_fraction,
         poly_vertex_min=args.poly_vertex_min,
         poly_vertex_max=args.poly_vertex_max,
+        poly_num_chips=args.poly_num_chips,
+        poly_chip_depth=args.poly_chip_depth,
         fragmentation=args.fragmentation,
         output_dir=args.output_dir,
         prefix=args.prefix,

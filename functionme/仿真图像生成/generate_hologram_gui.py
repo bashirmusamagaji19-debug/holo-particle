@@ -392,6 +392,20 @@ class HologramGeneratorGUI:
         self._add_entry(scroll_frame, "顶点数最大:", self.s_poly_vmax_var, row)
         row += 1
 
+        self.s_num_chips_var = tk.IntVar(value=6)
+        self.s_chip_depth_var = tk.DoubleVar(value=0.22)
+
+        self._add_entry(scroll_frame, "切角数量:", self.s_num_chips_var, row)
+        ttk.Label(scroll_frame, text="(0=纯凸包, 越多越碎)", foreground="gray").grid(
+            row=row, column=2, sticky=tk.W, padx=5
+        )
+        row += 1
+        self._add_entry(scroll_frame, "切角深度:", self.s_chip_depth_var, row)
+        ttk.Label(scroll_frame, text="(~0.1=浅削, ~0.35=深切)", foreground="gray").grid(
+            row=row, column=2, sticky=tk.W, padx=5
+        )
+        row += 1
+
         self._add_sep(scroll_frame, row)
         row += 1
 
@@ -567,6 +581,8 @@ class HologramGeneratorGUI:
             poly_indent_fraction=self.s_poly_indent_var.get(),
             poly_vertex_min=self.s_poly_vmin_var.get(),
             poly_vertex_max=self.s_poly_vmax_var.get(),
+            poly_num_chips=self.s_num_chips_var.get(),
+            poly_chip_depth=self.s_chip_depth_var.get(),
             output_dir=run_dir,
             prefix=prefix,
             seed=self.s_seed_var.get(),
