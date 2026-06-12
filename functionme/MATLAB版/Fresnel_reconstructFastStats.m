@@ -135,7 +135,7 @@ function [summary, stat] = iFastStatsGpuCore(holo, zVec, lambda, pixel, params)
     stat.curveSec = toc(tCurve);
 
     summary = iFinalizeSummaryFromMaps(candidateData, focusIdx, peakRatioApprox, ...
-        bestPatches, zVec, params, [ny, nx, nz]);
+        bestPatches, zVec, roiParams, [ny, nx, nz]);
 end
 
 function [summary, stat] = iFastStatsCpuCore(holo, zVec, lambda, pixel, params)
@@ -203,7 +203,7 @@ function [summary, stat] = iFastStatsCpuCore(holo, zVec, lambda, pixel, params)
     stat.curveSec = toc(tCurve);
 
     summary = iFinalizeSummaryFromMaps(candidateData, focusIdx, peakRatioApprox, ...
-        bestPatches, zVec, params, [ny, nx, nz]);
+        bestPatches, zVec, roiParams, [ny, nx, nz]);
 end
 
 function bestPatches = iCollectBestPatchesGpu(U0f, phaseBase, k_offset, zVec, candidates, bestPatchIdx, invertContrast)
@@ -295,7 +295,7 @@ function [focusIdx, peakRatioApprox] = iEstimateFocusFromMaps(candidateData)
     end
 end
 
-function summary = iFinalizeSummaryFromMaps(candidateData, focusIdx, peakRatioApprox, bestPatches, zVec, params, volumeSize)
+function summary = iFinalizeSummaryFromMaps(candidateData, focusIdx, ~, bestPatches, zVec, params, volumeSize)
     zVecUm = double(zVec(:)) * 1e6;
     numCand = numel(candidateData.candidates);
     coords3D = zeros(numCand, 3);
@@ -303,27 +303,46 @@ function summary = iFinalizeSummaryFromMaps(candidateData, focusIdx, peakRatioAp
     validMask = false(numCand, 1);
     stats = candidateData.stats;
 
+    isSim = isfield(params, 'simulationMode') && params.simulationMode;
+
     for n = 1:numCand
         c = candidateData.candidates(n);
         maxIdx = min(numel(zVecUm), max(1, double(focusIdx(n))));
-        peakRatio = peakRatioApprox(n);
-        isAwayFromEdge = (maxIdx > params.edgeMargin) && (maxIdx <= numel(zVecUm) - params.edgeMargin);
 
-        measureInfo = AS_refineMeasurementROI(bestPatches{n}, [c.cxLocal, c.cyLocal], ...
-            [1, 1, size(bestPatches{n}, 2), size(bestPatches{n}, 1)], params);
-        measureBox = measureInfo.measureBoxLocal;
-        measurePatch = bestPatches{n}(measureBox(2):measureBox(2)+measureBox(4)-1, ...
-            measureBox(1):measureBox(1)+measureBox(3)-1);
-        measureCenter = measureInfo.refinedCenterLocal - [measureBox(1), measureBox(2)] + 1;
+        if isSim
+            % ---- Simulation mode: Heywood equivalent diameter ----
+            % D_eq = 2 * sqrt(Area / pi) based on MIP binary mask area.
+            % This is the unified metric for all particle shapes (circle +
+            % irregular) — same standard used in HACPI cloud-particle
+            % characterization.  Irregular particles get a physically
+            % meaningful "equivalent circle" diameter from their projected
+            % area, not from the focus-patch Otsu threshold (which assumes
+            % compact circular focus spots).
+            areaPx = stats(n).Area;
+            heywoodDiamPx = 2 * sqrt(areaPx / pi);
+            stats(n).EquivDiameter = heywoodDiamPx;
+            stats(n).Area = areaPx;  % preserve for downstream volume calc
+        else
+            % ---- Experimental mode: focus-patch Otsu diameter ----
+            measureInfo = AS_refineMeasurementROI(bestPatches{n}, [c.cxLocal, c.cyLocal], ...
+                [1, 1, size(bestPatches{n}, 2), size(bestPatches{n}, 1)], params);
+            measureBox = measureInfo.measureBoxLocal;
+            measurePatch = bestPatches{n}(measureBox(2):measureBox(2)+measureBox(4)-1, ...
+                measureBox(1):measureBox(1)+measureBox(3)-1);
+            measureCenter = measureInfo.refinedCenterLocal - [measureBox(1), measureBox(2)] + 1;
 
-        focusDiamPx = iEstimateFocusDiameterFromPatch(measurePatch, ...
-            round(measureCenter(1)), round(measureCenter(2)), ...
-            params.xyThreshold, stats(n).EquivDiameter);
+            focusDiamPx = iEstimateFocusDiameterFromPatch(measurePatch, ...
+                round(measureCenter(1)), round(measureCenter(2)), ...
+                params.xyThreshold, stats(n).EquivDiameter);
+            stats(n).EquivDiameter = focusDiamPx;
+        end
 
-        stats(n).EquivDiameter = focusDiamPx;
         coords3D(n, :) = [c.centerXY(1), c.centerXY(2), zVecUm(maxIdx)];
         axialCurves{n} = zVecUm(maxIdx);
-        validMask(n) = isAwayFromEdge && (peakRatio >= params.minPeakRatio);
+        diamUm = stats(n).EquivDiameter * iGetFieldOr(params, 'pix_um', 1);
+        minValidDiamUm = iGetFieldOr(params, 'minValidDiamUm', 0);
+        isLargeEnough = diamUm >= minValidDiamUm;
+        validMask(n) = isLargeEnough;
     end
 
     summary = struct();
@@ -639,11 +658,7 @@ function focusDiamPx = iEstimateFocusDiameterFromPatch(roiFocus, cxLocal, cyLoca
         return;
     end
     roiFocus = AS_normalizeImage(roiFocus);
-    if exist('graythresh', 'file') == 2
-        baseLevel = xyThreshold;
-    else
-        baseLevel = xyThreshold;
-    end
+    baseLevel = xyThreshold;
     localLevel = max(0.35, min(0.85, max(baseLevel, 0.6 * xyThreshold)));
     bwFocus = imfill(bwareaopen(imbinarize(roiFocus, localLevel), 1), 'holes');
     if ~any(bwFocus(:))
@@ -733,6 +748,9 @@ function params = iFillDefaultParams(params)
     if ~isfield(params, 'roiMinRadius') || ~isfinite(params.roiMinRadius)
         params.roiMinRadius = 15;
     end
+    if ~isfield(params, 'minValidDiamUm') || ~isfinite(params.minValidDiamUm)
+        params.minValidDiamUm = 0;
+    end
 
     % --- 仿真模式标志 ---
     if ~isfield(params, 'simulationMode') || ~isscalar(params.simulationMode) || ~islogical(params.simulationMode)
@@ -788,8 +806,17 @@ function params = iFillDefaultParams(params)
     params.xyThreshold = min(max(params.xyThreshold, 0), 1);
     params.roiScale = max(0.1, params.roiScale);
     params.roiMinRadius = max(1, round(params.roiMinRadius));
+    params.minValidDiamUm = max(0, params.minValidDiamUm);
     params.minDiamPx = max(1, round(params.minDiamPx));
     params.maxDiamPx = max(params.minDiamPx, round(params.maxDiamPx));
     params.minCircularity = min(max(params.minCircularity, 0), 1);
     params.watershedHmin = max(0.01, params.watershedHmin);
+end
+
+function value = iGetFieldOr(s, name, fallback)
+    if isfield(s, name) && ~isempty(s.(name)) && all(isfinite(s.(name)(:)))
+        value = s.(name);
+    else
+        value = fallback;
+    end
 end
