@@ -1,0 +1,36 @@
+{
+  "N": 1024,
+  "wavelength_m": 6.38e-07,
+  "pixel_size_m": 3.45e-06,
+  "pixel_size_um": 3.45,
+  "n_particle": 1.38,
+  "n_medium": 1.0,
+  "dn": 0.3799999999999999,
+  "radius_um_range": [
+    50.0,
+    100.0
+  ],
+  "z_range_m": [
+    0.02,
+    0.035
+  ],
+  "n_circular": 10,
+  "n_irregular": 10,
+  "n_placed": 20,
+  "n_sphere": 10,
+  "n_aggregate": 5,
+  "n_polyhedron": 5,
+  "attenuation": 0.3,
+  "edge_sigma_px": 0.8,
+  "roughness": 0.0,
+  "snr_db": 0.0,
+  "fragmentation": "custom",
+  "poly_radial_jitter": 0.4,
+  "poly_spike_fraction": 0.12,
+  "poly_indent_fraction": 0.2,
+  "poly_vertex_min": 15,
+  "poly_vertex_max": 35,
+  "poly_num_fragments": 3,
+  "poly_fragment_overlap": 0.55,
+  "seed": 131
+}

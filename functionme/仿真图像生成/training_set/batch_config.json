@@ -1,0 +1,18 @@
+{
+  "num": 50,
+  "output_dir": "./training_set",
+  "N": 1024,
+  "circular": 10,
+  "irregular": 10,
+  "radius_min": 50.0,
+  "radius_max": 100.0,
+  "z_min": 20.0,
+  "z_max": 35.0,
+  "snr": 0.0,
+  "seed_start": 100,
+  "wavelength": 6.38e-07,
+  "pixel_size": 3.45e-06,
+  "n_particle": 1.38,
+  "attenuation": 0.3,
+  "roughness": 0.0
+}

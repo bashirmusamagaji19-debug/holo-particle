@@ -496,7 +496,8 @@ function out = iDetectCandidates(mip2D, params)
         bw = bwFinal;
 
         stats_raw = regionprops(bw, img2D, 'Centroid', 'WeightedCentroid', ...
-            'EquivDiameter', 'BoundingBox', 'Area', 'Perimeter');
+            'EquivDiameter', 'BoundingBox', 'Area', 'Perimeter', ...
+            'Solidity', 'Eccentricity', 'Extent', 'MajorAxisLength', 'MinorAxisLength', 'ConvexArea');
 
         out = struct();
         out.img2D = img2D;
@@ -571,7 +572,8 @@ function out = iDetectCandidates(mip2D, params)
         bw(L_watershed == 0) = 0;
 
         stats_raw = regionprops(bw, img2D, 'Centroid', 'WeightedCentroid', ...
-            'EquivDiameter', 'BoundingBox', 'Area', 'Perimeter');
+            'EquivDiameter', 'BoundingBox', 'Area', 'Perimeter', ...
+            'Solidity', 'Eccentricity', 'Extent', 'MajorAxisLength', 'MinorAxisLength', 'ConvexArea');
 
         out = struct();
         out.img2D = img2D;

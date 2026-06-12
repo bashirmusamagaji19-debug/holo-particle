@@ -353,8 +353,8 @@ function VolumeGUI_AngularSpectrum
     handles.hResultTable = uitable('Parent', rightPanel, ...
         'Units', 'normalized', ...
         'Position', [0.37 0.05 0.60 0.42], ...
-        'Data', cell(0, 7), ...
-        'ColumnName', {'ID', ['x (' muChar 'm)'], ['y (' muChar 'm)'], ['z (' muChar 'm)'], ['D_H (' muChar 'm)'], ['V (' muChar 'm^3)'], 'shape'}, ...
+        'Data', cell(0, 8), ...
+        'ColumnName', {'ID', ['x (' muChar 'm)'], ['y (' muChar 'm)'], ['z (' muChar 'm)'], ['D_H (' muChar 'm)'], ['V (' muChar 'm^3)'], 'shape', 'conf'}, ...
         'RowName', [], ...
         'BackgroundColor', [1 1 1], ...
         'ForegroundColor', [0 0 0]);
@@ -1546,7 +1546,7 @@ function VolumeGUI_AngularSpectrum
             xlabel(handlesIn.hHistAxes, ['直径 (' muChar 'm)'], 'Color', textColor);
             ylabel(handlesIn.hHistAxes, '粒子数量', 'Color', textColor);
             grid(handlesIn.hHistAxes, 'on');
-            set(handlesIn.hResultTable, 'Data', cell(0, 7));
+            set(handlesIn.hResultTable, 'Data', cell(0, 8));
             set(handlesIn.hSummaryText, 'String', '尚未生成统计结果');
             return;
         end
@@ -1579,8 +1579,9 @@ function VolumeGUI_AngularSpectrum
         if isstring(shapeType)
             shapeType = cellstr(shapeType);
         end
+        shapeConf = num2cell(statsResult.shapeConfidence(:));
         tableData = [num2cell([(1:size(statsResult.coordsUm, 1)).', ...
-            statsResult.coordsUm, statsResult.diamsUm(:), statsResult.volumeUm3(:)]), shapeType];
+            statsResult.coordsUm, statsResult.diamsUm(:), statsResult.volumeUm3(:)]), shapeType, shapeConf];
         set(handlesIn.hResultTable, 'Data', tableData);
     end
 
@@ -1609,7 +1610,13 @@ function VolumeGUI_AngularSpectrum
         reconRows = fastStats.volumeSize(1);
         reconCols = fastStats.volumeSize(2);
         methodName = '方法1：反向衍射';
-        mipImage = fastStats.img2D;
+        mipImage = fastStats.img2D;          % normalized [0,1] for visualization
+        % Use RAW MIP for classifier features (consistent with training data)
+        if isfield(fastStats, 'mip2D') && ~isempty(fastStats.mip2D)
+            mipRawForClassifier = fastStats.mip2D;
+        else
+            mipRawForClassifier = fastStats.img2D;
+        end
 
         if isfield(fastStats, 'candidateCoords3D') && ~isempty(fastStats.candidateCoords3D)
             candidateCoordsPx = fastStats.candidateCoords3D;
@@ -1647,8 +1654,17 @@ function VolumeGUI_AngularSpectrum
         candDiamUm = zeros(nCand, 1);
         candVolumeUm3 = zeros(nCand, 1);
         candCircularity = zeros(nCand, 1);
-        candShapeType = repmat({'irregular'}, nCand, 1);
-        shapeCircularityThreshold = 0.75;
+        candShapeConfidence = zeros(nCand, 1);
+
+        % ---- simulation mode: use trained classifier if available ----
+        isSim = isfield(fastStats, 'bwLow');  % simulation marker
+        if isSim
+            [candShapeType, candShapeConfidence] = predict_particle_shape(...
+                candidateStats, [], mipRawForClassifier, roiBoxesAll);
+        else
+            candShapeType = repmat({'circular'}, nCand, 1);
+        end
+
         for k = 1:nCand
             if k <= numel(candidateStats)
                 s = candidateStats(k);
@@ -1664,9 +1680,6 @@ function VolumeGUI_AngularSpectrum
                 end
             end
             candVolumeUm3(k) = pi * candDiamUm(k) ^ 3 / 6;
-            if candCircularity(k) >= shapeCircularityThreshold
-                candShapeType{k} = 'circular';
-            end
         end
         validMaskAll = validMaskAll & (candDiamUm >= minValidDiamUm);
         validIdx = find(validMaskAll);
@@ -1680,6 +1693,7 @@ function VolumeGUI_AngularSpectrum
         diamsPx = diamsUm / pix_um;
         volumeUm3 = candVolumeUm3(validIdx);
         shapeType = candShapeType(validIdx);
+        shapeConfidence = candShapeConfidence(validIdx);
 
         zStepUm = 1;
         if numel(zVecUm) > 1
@@ -1734,6 +1748,7 @@ function VolumeGUI_AngularSpectrum
             'diamsPx', diamsPx(:), ...
             'volumeUm3', volumeUm3(:), ...
             'shapeType', {shapeType(:)}, ...
+            'shapeConfidence', shapeConfidence(:), ...
             'pixUm', pix_um, ...
             'zVecUm', zVecUm(:), ...
             'zStepUm', zStepUm, ...
@@ -1752,7 +1767,7 @@ function VolumeGUI_AngularSpectrum
             'candidateVolumeUm3', candVolumeUm3, ...
             'candidateCircularity', candCircularity, ...
             'candidateShapeType', {candShapeType}, ...
-            'shapeCircularityThreshold', shapeCircularityThreshold, ...
+            'candidateShapeConfidence', candShapeConfidence(:), ...
             'simulationMode', isfield(fastStats, 'bwLow'), ...
             'minValidDiamUm', minValidDiamUm, ...
             'reconRows', reconRows, ...
