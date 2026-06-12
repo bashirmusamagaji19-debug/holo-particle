@@ -18,6 +18,9 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Tool working directories
+.reasonix/
+
 # Image files (too large for repo, generated artifacts)
 *.bmp
 *.BMP

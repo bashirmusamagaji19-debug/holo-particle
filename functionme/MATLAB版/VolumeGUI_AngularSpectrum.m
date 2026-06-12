@@ -412,7 +412,7 @@ function VolumeGUI_AngularSpectrum
     handles.hXYThreshold = uicontrol('Parent', paramPanel, 'Style', 'edit', ...
         'Units', 'normalized', ...
         'Position', [0.60 0.50 0.28 0.10], ...
-        'String', '0.65');
+        'String', '0.80');    % simulation-mode optimal: clean candidates
 
     % ROI半径倍率
     uicontrol('Parent', paramPanel, 'Style', 'text', ...
@@ -1856,13 +1856,12 @@ function VolumeGUI_AngularSpectrum
             rectangle(axMip, 'Position', roiBoxes(n, :), ...
                 'EdgeColor', boxColor, 'LineWidth', 1.5);
 
+            shownCount = shownCount + 1;
             tag = 'C';
             if ~isCirc, tag = 'I'; end
-            label = sprintf('%d%s', n, tag);
+            label = sprintf('%d%s', shownCount, tag);
             text(axMip, roiBoxes(n, 1) + 2, roiBoxes(n, 2) - 4, label, ...
                 'Color', boxColor, 'FontSize', 10, 'FontWeight', 'bold', 'Parent', axMip);
-
-            shownCount = shownCount + 1;
         end
 
         candidateCount = size(roiBoxes, 1);
